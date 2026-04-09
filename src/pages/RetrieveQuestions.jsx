@@ -26,8 +26,8 @@ export default function RetrieveQuestions({ showStatus }) {
   const [exam, setExam] = useState('')
   const [subject, setSubject] = useState('')
   const [chapter, setChapter] = useState('')
-  const [qType, setQType] = useState('mcq')
-  const [difficulty, setDifficulty] = useState('easy')
+  const [qType, setQType] = useState('')
+  const [difficulty, setDifficulty] = useState('')
   const [numQs, setNumQs] = useState(10)
   const [output, setOutput] = useState('')
 
@@ -100,6 +100,7 @@ export default function RetrieveQuestions({ showStatus }) {
           <div className="form-group">
             <label>Question Type:</label>
             <select value={qType} onChange={(e) => setQType(e.target.value)}>
+              <option value="">All Types</option>
               <option value="mcq">MCQ</option>
               <option value="short">Short Answer</option>
               <option value="long">Long Answer</option>
@@ -108,6 +109,7 @@ export default function RetrieveQuestions({ showStatus }) {
           <div className="form-group">
             <label>Difficulty:</label>
             <select value={difficulty} onChange={(e) => setDifficulty(e.target.value)}>
+              <option value="">All Levels</option>
               <option value="easy">Easy</option>
               <option value="medium">Medium</option>
               <option value="hard">Hard</option>
