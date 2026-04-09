@@ -1,12 +1,10 @@
 import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
-const API_BASE = import.meta.env.VITE_API_URL || ''
-
 export default function Dashboard() {
   const [stats, setStats] = useState([])
   const [loading, setLoading] = useState(true)
-  const [drillPath, setDrillPath] = useState([]) // [{type: 'exam', value: '10th CBSE Board'}, ...]
+  const [drillPath, setDrillPath] = useState([])
 
   useEffect(() => {
     fetchStats()
@@ -14,14 +12,27 @@ export default function Dashboard() {
 
   async function fetchStats() {
     try {
-      const { data: { session } } = await supabase.auth.getSession()
-      const response = await fetch(`${API_BASE}/api/stats`, {
-        headers: { 'Authorization': `Bearer ${session?.access_token}` }
-      })
-      const result = await response.json()
-      if (result.success) {
-        setStats(result.stats)
+      // Query Supabase directly — much faster than going through the Python serverless API
+      const { data, error } = await supabase
+        .from('questions')
+        .select('exam, subject, chapter, question_type')
+
+      if (error) {
+        console.error('Supabase error:', error)
+        return
       }
+
+      // Group client-side
+      const groups = {}
+      for (const row of data) {
+        const key = `${row.exam}|${row.subject}|${row.chapter}|${row.question_type}`
+        if (!groups[key]) {
+          groups[key] = { exam: row.exam, subject: row.subject, chapter: row.chapter, question_type: row.question_type, count: 0 }
+        }
+        groups[key].count++
+      }
+
+      setStats(Object.values(groups))
     } catch (err) {
       console.error('Failed to fetch stats:', err)
     } finally {
@@ -43,7 +54,6 @@ export default function Dashboard() {
     )
   }
 
-  // Filter stats based on current drill path
   function getFilteredStats() {
     let filtered = stats
     for (const crumb of drillPath) {
@@ -71,7 +81,6 @@ export default function Dashboard() {
     const filtered = getFilteredStats()
     const level = getCurrentLevel()
 
-    // Group by current level
     const groups = {}
     for (const row of filtered) {
       const key = row[level]
@@ -110,16 +119,13 @@ export default function Dashboard() {
     )
   }
 
-  // Summary stats
   function getSummary() {
     const filtered = getFilteredStats()
     const total = filtered.reduce((sum, r) => sum + r.count, 0)
     const mcq = filtered.filter(r => r.question_type === 'mcq').reduce((sum, r) => sum + r.count, 0)
     const short = filtered.filter(r => r.question_type === 'short').reduce((sum, r) => sum + r.count, 0)
     const long = filtered.filter(r => r.question_type === 'long').reduce((sum, r) => sum + r.count, 0)
-    const level = getCurrentLevel()
-    const uniqueCount = new Set(filtered.map(r => r[level])).size
-    return { total, mcq, short, long, uniqueCount }
+    return { total, mcq, short, long }
   }
 
   if (loading) {
@@ -132,7 +138,6 @@ export default function Dashboard() {
     <div className="dashboard-content">
       <h2>Question Inventory</h2>
 
-      {/* Breadcrumb */}
       <div className="breadcrumb">
         <span
           className={`breadcrumb-item ${drillPath.length > 0 ? 'clickable' : 'active'}`}
@@ -153,7 +158,6 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* Summary row */}
       <div className="summary-row">
         <div className="summary-card summary-total">
           <div className="summary-number">{summary.total}</div>
@@ -173,7 +177,6 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* Cards */}
       {renderCards()}
     </div>
   )
