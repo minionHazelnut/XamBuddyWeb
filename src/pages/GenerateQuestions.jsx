@@ -222,7 +222,7 @@ export default function GenerateQuestions({ showStatus }) {
               {newQuestions.length === 0 ? (
                 <p className="gen-empty">{generating ? 'Generating...' : 'No new questions yet'}</p>
               ) : (
-                <ol className="gen-question-list">
+                <ol className="gen-question-list" start={existingCount - newQuestions.length + 1}>
                   {newQuestions.map((q, i) => (
                     <li key={i}>{q.question}</li>
                   ))}
