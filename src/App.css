@@ -228,7 +228,7 @@
 /* ========== Main Content ========== */
 .main-content {
   flex: 1;
-  background: #EBFFF4;
+  background: #ffffff;
   padding: 32px;
   overflow-y: auto;
 }

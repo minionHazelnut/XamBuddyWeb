@@ -1,14 +1,23 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, Request
+from fastapi import FastAPI, HTTPException, Query, Depends, Request, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 import json
 import os
 import httpx
+import re
+import random
+import logging
 from datetime import datetime
 from jose import jwt, JWTError
+import fitz
+import anthropic
+import psycopg2
+from psycopg2 import OperationalError, DatabaseError
+
+logger = logging.getLogger(__name__)
 
 from database import get_db, Question, init_db
 
@@ -17,6 +26,330 @@ app = FastAPI(title="XamBuddy API", description="Educational Platform API")
 # Supabase JWT config - reads from environment variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+
+# ---------- Generate helpers ----------
+
+_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:xambuddypwd@139.59.93.35:5432/xambuddydb"
+
+
+def _normalize_psycopg2_dsn(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + url[len("postgresql+asyncpg://"):]
+    return url
+
+
+def get_db_connection():
+    raw = os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
+    dsn = _normalize_psycopg2_dsn(raw.strip())
+    return psycopg2.connect(dsn)
+
+
+def _difficulty_for_db(difficulty: str) -> str:
+    if difficulty == "mixed":
+        return "medium"
+    return difficulty
+
+
+def _question_type_for_db(q_type: str, item: dict) -> str:
+    if q_type == "mixed":
+        return item.get("question_type") or "short"
+    if q_type == "conceptual":
+        return "long"
+    return q_type
+
+
+def _exact_question_fingerprint(text: str) -> str:
+    s = (text or "").strip().lower()
+    return re.sub(r"\s+", " ", s)
+
+
+def _question_row_exists(cur, exam, subject, chapter, diff_db, row_type, norm_text: str) -> bool:
+    if not norm_text:
+        return True
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM questions
+            WHERE exam = %s
+              AND subject = %s
+              AND chapter IS NOT DISTINCT FROM %s
+              AND difficulty = %s
+              AND question_type = %s
+              AND lower(
+                    trim(
+                        both ' ' FROM regexp_replace(question_text, '[[:space:]]+', ' ', 'g')
+                    )
+                  ) = %s
+        )
+        """,
+        (exam, subject, chapter or None, diff_db, row_type, norm_text),
+    )
+    return cur.fetchone()[0]
+
+
+def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
+    qt = (q.get("question") or "").strip()
+    if len(qt) < 3:
+        return False
+    if qt[0] in "[{":
+        return False
+    if "```" in qt:
+        return False
+    low = qt[:80].lower()
+    if low.startswith('"question"') or low.startswith("'question'"):
+        return False
+    if row_type == "mcq":
+        opts = q.get("options")
+        if not isinstance(opts, dict) or len(opts) < 2:
+            return False
+    return True
+
+
+def save_questions(questions, q_type, difficulty, subject, exam, chapter: str = ""):
+    diff_db = _difficulty_for_db(difficulty)
+    chapter_db = chapter.strip() or None
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            for q in questions:
+                qtext_raw = q.get("question") or ""
+                row_type = _question_type_for_db(q_type, q)
+                if not _ai_item_is_clean_for_db(q, row_type):
+                    logger.warning("Skipping malformed AI question item: %s...", qtext_raw[:120])
+                    continue
+                norm = _exact_question_fingerprint(qtext_raw)
+                if not norm:
+                    continue
+                if _question_row_exists(cur, exam, subject, chapter_db, diff_db, row_type, norm):
+                    continue
+                if row_type == "mcq" and q.get("options") is not None:
+                    opts = json.dumps(q["options"])
+                else:
+                    opts = None
+                ans = q.get("answer")
+                if ans is not None:
+                    ans = str(ans)
+                expl = q.get("explanation")
+                if expl is not None:
+                    expl = str(expl)
+                else:
+                    expl = ""
+                cur.execute(
+                    """
+                    INSERT INTO questions (
+                        exam, subject, chapter, question_text, question_type,
+                        difficulty, options, correct_answer, explanation
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                    """,
+                    (exam, subject, chapter_db, qtext_raw.strip(), row_type,
+                     diff_db, opts, ans, expl),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _row_to_api_item(row, for_mixed_pool: bool):
+    (_id, _exam, _subj, _chapter, question_text, qtype, _diff,
+     options, correct_answer, explanation, _ts) = row
+    item = {
+        "question": question_text or "",
+        "answer": correct_answer if correct_answer is not None else "",
+        "explanation": explanation if explanation is not None else "",
+    }
+    if qtype == "mcq" and options is not None:
+        if isinstance(options, str):
+            item["options"] = json.loads(options)
+        else:
+            item["options"] = options
+    if for_mixed_pool:
+        item["question_type"] = qtype
+    return item
+
+
+def _db_question_type_filter(q_type: str):
+    if q_type == "mixed":
+        return "question_type IN ('mcq', 'short')", []
+    if q_type == "conceptual":
+        return "question_type = %s", ["long"]
+    return "question_type = %s", [q_type]
+
+
+def get_cached_questions(q_type, difficulty, subject, exam, chapter: str, limit,
+                         order: Literal["newest", "random"] = "newest"):
+    if limit <= 0:
+        return []
+    diff_db = _difficulty_for_db(difficulty)
+    order_sql = "ORDER BY RANDOM()" if order == "random" else "ORDER BY created_at DESC"
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            type_sql, type_params = _db_question_type_filter(q_type)
+            chapter_clause = "chapter IS NOT DISTINCT FROM %s"
+            params = [exam, subject, chapter.strip() or None, diff_db] + type_params + [limit]
+            cur.execute(
+                f"""
+                SELECT id, exam, subject, chapter, question_text, question_type, difficulty,
+                       options, correct_answer, explanation, created_at
+                FROM questions
+                WHERE exam = %s AND subject = %s AND {chapter_clause}
+                  AND difficulty = %s AND ({type_sql})
+                {order_sql}
+                LIMIT %s
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    for_mixed = q_type == "mixed"
+    return [_row_to_api_item(r, for_mixed) for r in rows]
+
+
+def extract_text(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
+
+def get_random_chunks(text, chunk_size=800, num_chunks=3):
+    chunks = [text[i: i + chunk_size] for i in range(0, len(text), chunk_size)]
+    return " ".join(random.sample(chunks, min(num_chunks, len(chunks))))
+
+
+FORMAT_EXAMPLES = {
+    "mcq": """[
+  {
+    "question": "string",
+    "options": {"A": "option text", "B": "option text", "C": "option text", "D": "option text"},
+    "answer": "A",
+    "explanation": "string"
+  }
+]""",
+    "short": """[
+  {"question": "string", "answer": "string", "explanation": "string"}
+]""",
+    "long": """[
+  {"question": "string", "answer": "string", "explanation": "string"}
+]""",
+    "conceptual": """[
+  {"question": "string", "answer": "string", "explanation": "string"}
+]""",
+    "mixed": """[
+  {"question_type": "mcq", "question": "string", "options": {"A": "...", "B": "...", "C": "...", "D": "..."}, "answer": "A", "explanation": "string"},
+  {"question_type": "short", "question": "string", "answer": "string", "explanation": "string"}
+]""",
+}
+
+TYPE_RULES = {
+    "mcq": """
+Multiple choice ONLY.
+Each item MUST:
+- Have exactly 4 options labeled A, B, C, D
+- Have answer as a single letter: A, B, C, or D
+- Include question, options, correct_answer, explanation
+CRITICAL RULES:
+1. Do NOT modify or rephrase option text — only reorder options if needed.
+2. The correct answer position should be reasonably distributed across A, B, C, D.
+3. You MAY shuffle option order to change answer position.
+4. Ensure correct_answer always matches the correct option after shuffling.
+5. Return ONLY valid JSON. No markdown, no ```json, no extra text.
+""",
+    "short": """
+Short answer ONLY.
+Each item MUST include: question, answer (1–3 sentences), explanation.
+No options. No MCQ fields. Include key terms required for scoring marks.
+Return ONLY valid JSON array.
+""",
+    "long": """
+Long answer ONLY.
+Each item MUST include: question, answer (detailed), explanation.
+No options. Focus on "why", "how", conceptual understanding.
+Return ONLY valid JSON array.
+""",
+    "mixed": """
+Include a mix of MCQ and short questions.
+Each item MUST include: question_type ("mcq" or "short").
+MCQ: options (A–D), correct_answer. Short: answer text only.
+Return ONLY valid JSON array.
+""",
+}
+
+MAX_TOKENS_FOR_TYPE = {
+    "mcq": 4096, "short": 4096, "long": 8192, "conceptual": 4096, "mixed": 8192,
+}
+
+
+def _strip_markdown_code_fence(text: str) -> str:
+    t = text.strip()
+    if not t.startswith("```"):
+        return t
+    lines = t.split("\n")
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _extract_json_array_string(text: str) -> str | None:
+    s = _strip_markdown_code_fence(text)
+    start = s.find("[")
+    if start == -1:
+        return None
+    depth = 0
+    in_str = False
+    i = start
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[start: i + 1]
+        i += 1
+    return None
+
+
+def _parse_ai_questions_json(raw: str, stop_reason: str | None) -> tuple[list | None, str | None]:
+    json_str = _extract_json_array_string(raw)
+    if not json_str:
+        return None, "Could not find a JSON array in the model output."
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        hint = ""
+        if stop_reason == "max_tokens":
+            hint = (" Output was likely cut off at the token limit. Try fewer questions per request, "
+                     "or use short/MCQ types.")
+        return None, f"JSON parse error: {e}.{hint}"
+    if not isinstance(data, list):
+        return None, "Model output was not a JSON array."
+    return data, None
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -204,48 +537,124 @@ async def get_chapters_by_board_subject(board: str, subject: str, db: AsyncSessi
 
 # --- Admin-only endpoints (require auth) ---
 
-@app.get("/api/generate")
+@app.post("/api/generate")
 async def generate_from_pdf(
-    file: str = Query(..., description="PDF file path or identifier"),
-    action: Optional[str] = Query("extract", description="Action: extract, analyze, convert"),
+    file: UploadFile = File(...),
+    difficulty: Literal["easy", "medium", "hard", "mixed"] = Form(...),
+    q_type: Literal["mcq", "short", "long", "conceptual", "mixed"] = Form(...),
+    num_q: int = Form(...),
+    subject: str = Form("general"),
+    exam: str = Form("general"),
+    chapter: str = Form(...),
     user: dict = Depends(get_current_user)
 ):
-    """Process PDF files for question generation (admin only)."""
+    """Generate questions from PDF using Claude API (admin only)."""
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
+    if num_q < 1:
+        raise HTTPException(status_code=400, detail="num_q must be at least 1.")
+    if not chapter or not chapter.strip():
+        raise HTTPException(status_code=400, detail="chapter is required.")
+
     try:
-        if action == "extract":
-            result = {
-                "success": True, "action": "extract", "file": file,
-                "extracted_content": f"Sample content extracted from {file}",
-                "questions_generated": 5, "timestamp": datetime.now().isoformat()
-            }
-        elif action == "analyze":
-            result = {
-                "success": True, "action": "analyze", "file": file,
-                "analysis": {
-                    "page_count": 10, "word_count": 2500,
-                    "topics_detected": ["Mathematics", "Algebra", "Geometry"],
-                    "difficulty_level": "medium"
-                },
-                "timestamp": datetime.now().isoformat()
-            }
-        elif action == "convert":
-            result = {
-                "success": True, "action": "convert", "file": file,
-                "converted_format": "json",
-                "output_file": f"{file}_converted.json",
-                "timestamp": datetime.now().isoformat()
-            }
-        else:
-            result = {
-                "success": True, "action": "default", "file": file,
-                "message": f"PDF {file} processed successfully",
-                "timestamp": datetime.now().isoformat()
-            }
+        cached = get_cached_questions(q_type, difficulty, subject, exam, chapter, num_q)
+    except (OperationalError, DatabaseError) as e:
+        logger.exception("Database error while reading questions cache")
+        raise HTTPException(status_code=503, detail="Could not reach the database. Try again later.") from e
 
-        return result
+    if len(cached) >= num_q:
+        return {"questions": cached[:num_q]}
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    content = await file.read()
+    try:
+        text = extract_text(content)
+    except fitz.FileDataError:
+        raise HTTPException(
+            status_code=400,
+            detail="Could not read that file as a PDF. Upload a real PDF (not a Word/image file renamed to .pdf).",
+        )
+
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="No text found in the PDF. Try a different file or one with selectable text.",
+        )
+
+    selected_content = get_random_chunks(text)
+
+    difficulty_map = {
+        "easy": "basic recall", "medium": "understanding and application",
+        "hard": "deep reasoning", "mixed": "mix of all levels",
+    }
+    type_map = {
+        "mcq": "multiple choice with 4 options (A–D), letter answer, explanation",
+        "short": "short answer (1–3 sentences per answer), no choices",
+        "long": "long-form paragraph answers, why/how conceptual answers (paragraph), no choices",
+        "mixed": "mix of MCQ and short-answer style items as in FORMAT",
+    }
+
+    format_example = FORMAT_EXAMPLES[q_type]
+    type_rule = TYPE_RULES[q_type]
+    max_out = MAX_TOKENS_FOR_TYPE[q_type]
+
+    prompt = f"""
+You are a strict JSON generator.
+
+Generate exactly {num_q} questions based ONLY on the CONTENT below.
+
+User-selected question type: {q_type}
+Difficulty focus: {difficulty_map[difficulty]}
+Style: {type_map[q_type]}
+
+CRITICAL — follow this type exactly:
+{type_rule}
+If the type is not "mcq", you MUST NOT output "options" or A/B/C/D choices.
+
+RULES:
+- Return ONLY valid JSON (one array). Do NOT wrap in markdown code fences (no ```).
+- No markdown, no headings, no text outside the JSON array
+- The entire JSON must be complete and parseable — if you run out of space, shorten answers; never stop mid-quote or mid-string.
+
+FORMAT (match this structure exactly for type "{q_type}"):
+
+{format_example}
+
+CONTENT:
+{selected_content}
+"""
+
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = claude_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=max_out,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = response.content[0].text
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "max_tokens":
+        logger.warning("Claude stopped at max_tokens; JSON may be incomplete (q_type=%s)", q_type)
+
+    data, parse_err = _parse_ai_questions_json(raw, stop_reason)
+    if parse_err:
+        err = {"error": parse_err, "raw": raw}
+        if stop_reason == "max_tokens":
+            err["hint"] = (
+                "Model hit the output limit. Try generating fewer questions at once, "
+                "or use short-answer / MCQ mode for this chapter."
+            )
+        return err
+
+    try:
+        save_questions(data, q_type, difficulty, subject, exam, chapter)
+    except (OperationalError, DatabaseError) as e:
+        logger.exception("Database error while saving questions")
+        raise HTTPException(
+            status_code=503,
+            detail="Generated questions but could not save them. Try again later.",
+        ) from e
+
+    return {"questions": data}
 
 @app.post("/api/questions")
 async def add_question(

@@ -40,18 +40,37 @@ export default function GenerateQuestions({ showStatus }) {
       showStatus('Please select a PDF file', 'error')
       return
     }
+    if (!chapter) {
+      showStatus('Please select a chapter', 'error')
+      return
+    }
     showStatus('Generating questions...', 'success')
     try {
-      const headers = await getAuthHeaders()
-      const params = new URLSearchParams({ file: file.name, action: 'extract' })
-      const response = await fetch(`${API_BASE}/api/generate?${params}`, { headers })
+      const { data: { session } } = await supabase.auth.getSession()
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('exam', exam)
+      formData.append('subject', subject)
+      formData.append('chapter', chapter)
+      formData.append('q_type', qType)
+      formData.append('difficulty', difficulty)
+      formData.append('num_q', numQs)
+
+      const response = await fetch(`${API_BASE}/api/generate`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${session?.access_token}` },
+        body: formData
+      })
       const result = await response.json()
-      if (result.success) {
+      if (result.error) {
+        setOutput(`Error: ${result.error}${result.hint ? '\n' + result.hint : ''}`)
+        showStatus('Failed to generate questions', 'error')
+      } else if (result.questions) {
+        setOutput(JSON.stringify(result.questions, null, 2))
+        showStatus(`Generated ${result.questions.length} questions!`, 'success')
+      } else {
         setOutput(JSON.stringify(result, null, 2))
         showStatus('Questions generated successfully!', 'success')
-      } else {
-        setOutput(`Error: ${result.detail || 'Unknown error'}`)
-        showStatus('Failed to generate questions', 'error')
       }
     } catch (err) {
       setOutput(`Error: ${err.message}`)
@@ -106,6 +125,8 @@ export default function GenerateQuestions({ showStatus }) {
               <option value="mcq">MCQ</option>
               <option value="short">Short Answer</option>
               <option value="long">Long Answer</option>
+              <option value="conceptual">Conceptual</option>
+              <option value="mixed">Mixed</option>
             </select>
           </div>
           <div className="form-group">
@@ -114,6 +135,7 @@ export default function GenerateQuestions({ showStatus }) {
               <option value="easy">Easy</option>
               <option value="medium">Medium</option>
               <option value="hard">Hard</option>
+              <option value="mixed">Mixed</option>
             </select>
           </div>
           <div className="form-group">
