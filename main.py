@@ -11,7 +11,8 @@ import re
 import random
 import logging
 from datetime import datetime
-from jose import jwt, JWTError
+from jose import jwt as jose_jwt, JWTError
+import jwt as pyjwt
 import fitz
 import anthropic
 import psycopg2
@@ -357,26 +358,15 @@ async def startup_event():
 
 # --- Auth dependency ---
 
-_jwks_cache = {"keys": None, "fetched_at": 0}
+_jwks_client = None
 
 
-async def _get_supabase_jwks():
-    """Fetch and cache JWKS from Supabase for ES256 token verification."""
-    import time
-    now = time.time()
-    # Cache for 1 hour
-    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < 3600:
-        return _jwks_cache["keys"]
-
-    jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(jwks_url)
-        resp.raise_for_status()
-        jwks = resp.json()
-
-    _jwks_cache["keys"] = jwks
-    _jwks_cache["fetched_at"] = now
-    return jwks
+def _get_jwks_client():
+    global _jwks_client
+    if _jwks_client is None:
+        jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+        _jwks_client = pyjwt.PyJWKClient(jwks_url, cache_keys=True)
+    return _jwks_client
 
 
 async def get_current_user(request: Request) -> dict:
@@ -388,9 +378,9 @@ async def get_current_user(request: Request) -> dict:
     token = auth_header.split(" ", 1)[1]
 
     try:
-        header = jwt.get_unverified_header(token)
+        header = pyjwt.get_unverified_header(token)
         alg = header.get("alg", "")
-    except JWTError as e:
+    except pyjwt.exceptions.DecodeError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token header: {e}")
 
     try:
@@ -398,24 +388,25 @@ async def get_current_user(request: Request) -> dict:
             # Legacy HS256 shared secret
             if not SUPABASE_JWT_SECRET:
                 raise HTTPException(status_code=500, detail="Server auth not configured")
-            payload = jwt.decode(
+            payload = pyjwt.decode(
                 token,
                 SUPABASE_JWT_SECRET,
-                algorithms=["HS256", "HS384", "HS512"],
+                algorithms=["HS256"],
                 audience="authenticated",
             )
         else:
-            # ES256 / asymmetric keys — verify via JWKS
+            # ES256 / asymmetric keys — fetch public key from Supabase JWKS
             if not SUPABASE_URL:
                 raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
-            jwks = await _get_supabase_jwks()
-            payload = jwt.decode(
+            jwks_client = _get_jwks_client()
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            payload = pyjwt.decode(
                 token,
-                jwks,
-                algorithms=["ES256", "ES384", "RS256", "RS384", "RS512", "EdDSA"],
+                signing_key.key,
+                algorithms=["ES256", "ES384", "RS256", "EdDSA"],
                 audience="authenticated",
             )
-    except JWTError as e:
+    except pyjwt.exceptions.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
     return payload
