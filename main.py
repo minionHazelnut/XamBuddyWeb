@@ -27,7 +27,7 @@ app = FastAPI(title="XamBuddy API", description="Educational Platform API")
 # Supabase JWT config - reads from environment variables
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("CLAUDE_API_KEY", "")
 
 # ---------- Generate helpers ----------
 
@@ -653,7 +653,7 @@ CONTENT:
 {selected_content}
 """
 
-    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    claude_client = anthropic.Anthropic()
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=max_out,
