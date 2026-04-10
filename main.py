@@ -357,6 +357,28 @@ async def startup_event():
 
 # --- Auth dependency ---
 
+_jwks_cache = {"keys": None, "fetched_at": 0}
+
+
+async def _get_supabase_jwks():
+    """Fetch and cache JWKS from Supabase for ES256 token verification."""
+    import time
+    now = time.time()
+    # Cache for 1 hour
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < 3600:
+        return _jwks_cache["keys"]
+
+    jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(jwks_url)
+        resp.raise_for_status()
+        jwks = resp.json()
+
+    _jwks_cache["keys"] = jwks
+    _jwks_cache["fetched_at"] = now
+    return jwks
+
+
 async def get_current_user(request: Request) -> dict:
     """Verify Supabase JWT from Authorization header and return the user payload."""
     auth_header = request.headers.get("Authorization")
@@ -365,16 +387,34 @@ async def get_current_user(request: Request) -> dict:
 
     token = auth_header.split(" ", 1)[1]
 
-    if not SUPABASE_JWT_SECRET:
-        raise HTTPException(status_code=500, detail="Server auth not configured")
+    try:
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg", "")
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token header: {e}")
 
     try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256", "HS384", "HS512"],
-            audience="authenticated",
-        )
+        if alg.startswith("HS"):
+            # Legacy HS256 shared secret
+            if not SUPABASE_JWT_SECRET:
+                raise HTTPException(status_code=500, detail="Server auth not configured")
+            payload = jwt.decode(
+                token,
+                SUPABASE_JWT_SECRET,
+                algorithms=["HS256", "HS384", "HS512"],
+                audience="authenticated",
+            )
+        else:
+            # ES256 / asymmetric keys — verify via JWKS
+            if not SUPABASE_URL:
+                raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
+            jwks = await _get_supabase_jwks()
+            payload = jwt.decode(
+                token,
+                jwks,
+                algorithms=["ES256", "ES384", "RS256", "RS384", "RS512", "EdDSA"],
+                audience="authenticated",
+            )
     except JWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
