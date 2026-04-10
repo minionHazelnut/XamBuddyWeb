@@ -586,14 +586,6 @@ async def generate_from_pdf(
     if not chapter or not chapter.strip():
         raise HTTPException(status_code=400, detail="chapter is required.")
 
-    try:
-        cached = get_cached_questions(q_type, difficulty, subject, exam, chapter, num_q)
-    except (OperationalError, DatabaseError) as e:
-        logger.exception("Database error while reading questions cache")
-        raise HTTPException(status_code=503, detail="Could not reach the database. Try again later.") from e
-
-    if len(cached) >= num_q:
-        return {"questions": cached[:num_q]}
 
     content = await file.read()
     try:
