@@ -612,6 +612,14 @@ async def generate_from_pdf(
 
     selected_content = get_random_chunks(text)
 
+    # Fetch existing question texts to avoid duplicates
+    existing_questions = []
+    try:
+        existing = get_cached_questions(q_type, difficulty, subject, exam, chapter, 500)
+        existing_questions = [q["question"] for q in existing if q.get("question")]
+    except Exception:
+        pass
+
     difficulty_map = {
         "easy": "basic recall", "medium": "understanding and application",
         "hard": "deep reasoning", "mixed": "mix of all levels",
@@ -651,6 +659,14 @@ FORMAT (match this structure exactly for type "{q_type}"):
 
 CONTENT:
 {selected_content}
+"""
+
+    if existing_questions:
+        dedup_list = "\n".join(f"- {q}" for q in existing_questions)
+        prompt += f"""
+
+ALREADY GENERATED (do NOT repeat or rephrase these — generate completely NEW and DIFFERENT questions):
+{dedup_list}
 """
 
     claude_client = anthropic.Anthropic()
