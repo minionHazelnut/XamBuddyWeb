@@ -577,9 +577,8 @@ async def generate_from_pdf(
     subject: str = Form("general"),
     exam: str = Form("general"),
     chapter: str = Form(...),
-    user: dict = Depends(get_current_user)
 ):
-    """Generate questions from PDF using Claude API (admin only)."""
+    """Generate questions from PDF using Claude API."""
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
     if num_q < 1:

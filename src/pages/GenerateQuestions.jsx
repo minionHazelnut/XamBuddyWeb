@@ -46,7 +46,6 @@ export default function GenerateQuestions({ showStatus }) {
     }
     showStatus('Generating questions...', 'success')
     try {
-      const { data: { session } } = await supabase.auth.getSession()
       const formData = new FormData()
       formData.append('file', file)
       formData.append('exam', exam)
@@ -58,7 +57,6 @@ export default function GenerateQuestions({ showStatus }) {
 
       const response = await fetch(`${API_BASE}/api/generate`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${session?.access_token}` },
         body: formData
       })
       const result = await response.json()
