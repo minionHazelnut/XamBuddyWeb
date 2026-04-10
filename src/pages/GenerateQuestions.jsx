@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
@@ -14,14 +14,6 @@ function getChapters(exam, subject) {
   return CHAPTERS_BY_EXAM_SUBJECT[exam]?.[subject] || []
 }
 
-async function getAuthHeaders() {
-  const { data: { session } } = await supabase.auth.getSession()
-  return {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${session?.access_token}`
-  }
-}
-
 export default function GenerateQuestions({ showStatus }) {
   const [exam, setExam] = useState('')
   const [subject, setSubject] = useState('')
@@ -30,9 +22,42 @@ export default function GenerateQuestions({ showStatus }) {
   const [difficulty, setDifficulty] = useState('easy')
   const [numQs, setNumQs] = useState(5)
   const [file, setFile] = useState(null)
-  const [output, setOutput] = useState('')
+  const [generating, setGenerating] = useState(false)
+  const [existingQuestions, setExistingQuestions] = useState([])
+  const [newQuestions, setNewQuestions] = useState([])
+  const [existingCount, setExistingCount] = useState(0)
+  const [loadingExisting, setLoadingExisting] = useState(false)
 
   const chapters = getChapters(exam, subject)
+
+  // Fetch existing questions when filters change
+  useEffect(() => {
+    if (exam && subject && chapter) {
+      fetchExisting()
+    } else {
+      setExistingQuestions([])
+      setExistingCount(0)
+    }
+  }, [exam, subject, chapter, qType, difficulty])
+
+  async function fetchExisting() {
+    setLoadingExisting(true)
+    try {
+      const params = new URLSearchParams({
+        exam, subject, chapter, q_type: qType, difficulty, limit: '500', shuffle: 'false'
+      })
+      const resp = await fetch(`${API_BASE}/api/retrieve?${params}`)
+      const data = await resp.json()
+      if (data.questions) {
+        setExistingQuestions(data.questions)
+        setExistingCount(data.questions.length)
+      }
+    } catch {
+      setExistingQuestions([])
+      setExistingCount(0)
+    }
+    setLoadingExisting(false)
+  }
 
   async function handleGenerate(e) {
     e.preventDefault()
@@ -44,7 +69,8 @@ export default function GenerateQuestions({ showStatus }) {
       showStatus('Please select a chapter', 'error')
       return
     }
-    showStatus('Generating questions...', 'success')
+    setGenerating(true)
+    setNewQuestions([])
     try {
       const formData = new FormData()
       formData.append('file', file)
@@ -61,24 +87,25 @@ export default function GenerateQuestions({ showStatus }) {
       })
       const result = await response.json()
       if (result.error) {
-        setOutput(`Error: ${result.error}${result.hint ? '\n' + result.hint : ''}`)
-        showStatus('Failed to generate questions', 'error')
+        showStatus(`Failed: ${result.error}`, 'error')
       } else if (result.questions) {
-        setOutput(JSON.stringify(result.questions, null, 2))
-        showStatus(`Generated ${result.questions.length} questions!`, 'success')
-      } else {
-        setOutput(JSON.stringify(result, null, 2))
-        showStatus('Questions generated successfully!', 'success')
+        setNewQuestions(result.questions)
+        showStatus(`Generated ${result.questions.length} new questions!`, 'success')
+        // Refresh existing questions to show updated count
+        await fetchExisting()
       }
     } catch (err) {
-      setOutput(`Error: ${err.message}`)
-      showStatus('Error generating questions', 'error')
+      showStatus(`Error: ${err.message}`, 'error')
     }
+    setGenerating(false)
   }
+
+  const filterLabel = [exam, subject, chapter, qType.toUpperCase(), difficulty].filter(Boolean).join(' / ')
 
   return (
     <div className="page-content">
       <h2>Generate from PDF</h2>
+
       <form onSubmit={handleGenerate} className="form-panel">
         <div className="form-group">
           <label>Upload PDF File:</label>
@@ -142,10 +169,69 @@ export default function GenerateQuestions({ showStatus }) {
           </div>
         </div>
 
-        <button type="submit">Generate Questions</button>
+        <button type="submit" disabled={generating}>
+          {generating ? 'Generating...' : 'Generate Questions'}
+        </button>
       </form>
 
-      {output && <div className="output-box">{output}</div>}
+      {/* Loading overlay */}
+      {generating && (
+        <div className="gen-loading">
+          <div className="gen-spinner"></div>
+          <p>Generating {numQs} {qType.toUpperCase()} questions...</p>
+          <p className="gen-loading-sub">This may take 15-30 seconds depending on the number of questions</p>
+        </div>
+      )}
+
+      {/* Stats bar */}
+      {exam && subject && chapter && (
+        <div className="gen-stats">
+          <span className="gen-stats-label">{filterLabel}</span>
+          <span className="gen-stats-count">
+            {loadingExisting ? '...' : `${existingCount} questions in database`}
+            {newQuestions.length > 0 && ` (+${newQuestions.length} just added)`}
+          </span>
+        </div>
+      )}
+
+      {/* Two-panel comparison */}
+      {(existingQuestions.length > 0 || newQuestions.length > 0) && (
+        <div className="gen-panels">
+          <div className="gen-panel">
+            <div className="gen-panel-header">
+              <h3>Existing Questions ({existingCount})</h3>
+            </div>
+            <div className="gen-panel-body">
+              {existingQuestions.length === 0 ? (
+                <p className="gen-empty">No existing questions for this category</p>
+              ) : (
+                <ol className="gen-question-list">
+                  {existingQuestions.map((q, i) => (
+                    <li key={i}>{q.question}</li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </div>
+
+          <div className="gen-panel gen-panel-new">
+            <div className="gen-panel-header gen-panel-header-new">
+              <h3>Newly Generated ({newQuestions.length})</h3>
+            </div>
+            <div className="gen-panel-body">
+              {newQuestions.length === 0 ? (
+                <p className="gen-empty">{generating ? 'Generating...' : 'No new questions yet'}</p>
+              ) : (
+                <ol className="gen-question-list">
+                  {newQuestions.map((q, i) => (
+                    <li key={i}>{q.question}</li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
