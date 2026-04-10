@@ -284,7 +284,7 @@ Return ONLY valid JSON array.
 }
 
 MAX_TOKENS_FOR_TYPE = {
-    "mcq": 4096, "short": 4096, "long": 8192, "conceptual": 4096, "mixed": 8192,
+    "mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192,
 }
 
 
@@ -644,6 +644,7 @@ RULES:
 - Return ONLY valid JSON (one array). Do NOT wrap in markdown code fences (no ```).
 - No markdown, no headings, no text outside the JSON array
 - The entire JSON must be complete and parseable — if you run out of space, shorten answers; never stop mid-quote or mid-string.
+- Do NOT reference specific examples, figures, diagrams, tables, or page numbers from the source material (e.g. "In Example 3..." or "As shown in Figure 2..."). Students will not have access to the PDF. Each question must be fully self-contained and understandable on its own.
 
 FORMAT (match this structure exactly for type "{q_type}"):
 
