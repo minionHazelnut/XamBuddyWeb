@@ -372,7 +372,7 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(
             token,
             SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
+            algorithms=["HS256", "HS384", "HS512"],
             audience="authenticated",
         )
     except JWTError as e:
