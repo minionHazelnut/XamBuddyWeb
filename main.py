@@ -254,7 +254,7 @@ def _parse_ai_questions_json(raw, stop_reason):
 async def health_check():
     key = CLAUDE_API_KEY
     key_debug = (key[:8] + "..." + key[-4:]) if len(key) > 12 else ("SET" if key else "MISSING")
-    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "claude_key": key_debug}
+    return {"status": "healthy", "timestamp": datetime.now().isoformat(), "claude_key": key_debug, "key_len": len(key), "has_newline": "\n" in key or "\r" in key}
 
 @app.get("/api/retrieve")
 async def retrieve_questions(
