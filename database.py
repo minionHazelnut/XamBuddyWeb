@@ -5,13 +5,15 @@ from datetime import datetime
 import os
 
 # Database URL from environment variable, with fallback
-DATABASE_URL = os.environ.get(
+_RAW_DB_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql+asyncpg://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
 )
+# Ensure SSL is enabled for Supabase
+DATABASE_URL = _RAW_DB_URL if "ssl=" in _RAW_DB_URL else _RAW_DB_URL + "?ssl=require"
 
 # Create async engine
-engine = create_async_engine(DATABASE_URL, echo=True)
+engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # Base class for models
