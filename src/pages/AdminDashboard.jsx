@@ -5,6 +5,7 @@ import Dashboard from './Dashboard'
 import GenerateQuestions from './GenerateQuestions'
 import RetrieveQuestions from './RetrieveQuestions'
 import ExamPaperUploads from './ExamPaperUploads'
+import ExamPaperRetrieve from './ExamPaperRetrieve'
 
 export default function AdminDashboard() {
   const navigate = useNavigate()
@@ -33,6 +34,7 @@ export default function AdminDashboard() {
     { id: 'generate', label: 'Generate Questions', icon: '\u2B06' },
     { id: 'retrieve', label: 'Retrieve Questions', icon: '\u2B07' },
     { id: 'exam-uploads', label: 'Exam Paper Uploads', icon: '\u{1F4C4}' },
+    { id: 'exam-retrieve', label: 'Exam Paper Retrieve', icon: '\u{1F50D}' },
   ]
 
   return (
@@ -76,6 +78,7 @@ export default function AdminDashboard() {
         {activeTab === 'generate' && <GenerateQuestions showStatus={showStatus} />}
         {activeTab === 'retrieve' && <RetrieveQuestions showStatus={showStatus} />}
         {activeTab === 'exam-uploads' && <ExamPaperUploads showStatus={showStatus} />}
+        {activeTab === 'exam-retrieve' && <ExamPaperRetrieve showStatus={showStatus} />}
       </main>
     </div>
   )
