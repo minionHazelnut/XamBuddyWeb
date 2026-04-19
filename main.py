@@ -13,7 +13,8 @@ import logging
 from datetime import datetime
 from jose import jwt as jose_jwt, JWTError
 import jwt as pyjwt
-import fitz
+from pypdf import PdfReader
+import io
 import anthropic
 import psycopg2
 from psycopg2 import OperationalError, DatabaseError
@@ -213,10 +214,10 @@ def get_cached_questions(q_type, difficulty, subject, exam, chapter: str, limit,
 
 
 def extract_text(file_bytes):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    reader = PdfReader(io.BytesIO(file_bytes))
     text = ""
-    for page in doc:
-        text += page.get_text()
+    for page in reader.pages:
+        text += page.extract_text() or ""
     return text
 
 
