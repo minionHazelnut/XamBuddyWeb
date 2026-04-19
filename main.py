@@ -1,49 +1,54 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, Request, UploadFile, File, Form
-from typing import Optional, Dict, Any, Literal
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from typing import Optional, Literal
 import json
 import os
 import re
 import random
 import logging
+import urllib.request
+import urllib.parse
 from datetime import datetime
-import jwt as pyjwt
 from pypdf import PdfReader
 import io
 import anthropic
-import psycopg2
-from psycopg2 import OperationalError, DatabaseError
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="XamBuddy API", description="Educational Platform API")
+app = FastAPI(title="XamBuddy API")
 
-# Supabase JWT config - reads from environment variables
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://klfekdsdosqpymxcikjw.supabase.co")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("CLAUDE_API_KEY", "")
 
-# ---------- Generate helpers ----------
+# ---------- Supabase REST helpers ----------
 
-_DEFAULT_DATABASE_URL = "postgresql://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
+def _sb_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
 
+def _sb_get(table, params=None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers=_sb_headers())
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
 
-def _normalize_psycopg2_dsn(url: str) -> str:
-    if url.startswith("postgresql+asyncpg://"):
-        return "postgresql://" + url[len("postgresql+asyncpg://"):]
-    return url
+def _sb_post(table, data):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, headers=_sb_headers(), method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
 
-
-def get_db_connection():
-    raw = os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
-    dsn = _normalize_psycopg2_dsn(raw.strip())
-    return psycopg2.connect(dsn, sslmode="require")
-
+# ---------- Question helpers ----------
 
 def _difficulty_for_db(difficulty: str) -> str:
-    if difficulty == "mixed":
-        return "medium"
-    return difficulty
-
+    return "medium" if difficulty == "mixed" else difficulty
 
 def _question_type_for_db(q_type: str, item: dict) -> str:
     if q_type == "mixed":
@@ -52,43 +57,13 @@ def _question_type_for_db(q_type: str, item: dict) -> str:
         return "long"
     return q_type
 
-
 def _exact_question_fingerprint(text: str) -> str:
     s = (text or "").strip().lower()
     return re.sub(r"\s+", " ", s)
 
-
-def _question_row_exists(cur, exam, subject, chapter, diff_db, row_type, norm_text: str) -> bool:
-    if not norm_text:
-        return True
-    cur.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1 FROM questions
-            WHERE exam = %s
-              AND subject = %s
-              AND chapter IS NOT DISTINCT FROM %s
-              AND difficulty = %s
-              AND question_type = %s
-              AND lower(
-                    trim(
-                        both ' ' FROM regexp_replace(question_text, '[[:space:]]+', ' ', 'g')
-                    )
-                  ) = %s
-        )
-        """,
-        (exam, subject, chapter or None, diff_db, row_type, norm_text),
-    )
-    return cur.fetchone()[0]
-
-
 def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
     qt = (q.get("question") or "").strip()
-    if len(qt) < 3:
-        return False
-    if qt[0] in "[{":
-        return False
-    if "```" in qt:
+    if len(qt) < 3 or qt[0] in "[{" or "```" in qt:
         return False
     low = qt[:80].lower()
     if low.startswith('"question"') or low.startswith("'question'"):
@@ -99,194 +74,128 @@ def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
             return False
     return True
 
+def _get_existing_fingerprints(exam, subject, chapter_db):
+    params = {
+        "select": "question_text",
+        "exam": f"eq.{exam}",
+        "subject": f"eq.{subject}",
+        "limit": 1000,
+    }
+    if chapter_db:
+        params["chapter"] = f"eq.{chapter_db}"
+    else:
+        params["chapter"] = "is.null"
+    try:
+        rows = _sb_get("questions", params)
+        return {_exact_question_fingerprint(r["question_text"]) for r in rows}
+    except Exception:
+        return set()
 
-def save_questions(questions, q_type, difficulty, subject, exam, chapter: str = ""):
+def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
     diff_db = _difficulty_for_db(difficulty)
     chapter_db = chapter.strip() or None
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            for q in questions:
-                qtext_raw = q.get("question") or ""
-                row_type = _question_type_for_db(q_type, q)
-                if not _ai_item_is_clean_for_db(q, row_type):
-                    logger.warning("Skipping malformed AI question item: %s...", qtext_raw[:120])
-                    continue
-                norm = _exact_question_fingerprint(qtext_raw)
-                if not norm:
-                    continue
-                if _question_row_exists(cur, exam, subject, chapter_db, diff_db, row_type, norm):
-                    continue
-                if row_type == "mcq" and q.get("options") is not None:
-                    opts = json.dumps(q["options"])
-                else:
-                    opts = None
-                ans = q.get("answer")
-                if ans is not None:
-                    ans = str(ans)
-                expl = q.get("explanation")
-                if expl is not None:
-                    expl = str(expl)
-                else:
-                    expl = ""
-                cur.execute(
-                    """
-                    INSERT INTO questions (
-                        exam, subject, chapter, question_text, question_type,
-                        difficulty, options, correct_answer, explanation
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-                    """,
-                    (exam, subject, chapter_db, qtext_raw.strip(), row_type,
-                     diff_db, opts, ans, expl),
-                )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    existing = _get_existing_fingerprints(exam, subject, chapter_db)
+    to_insert = []
+    for q in questions:
+        qtext_raw = q.get("question") or ""
+        row_type = _question_type_for_db(q_type, q)
+        if not _ai_item_is_clean_for_db(q, row_type):
+            continue
+        norm = _exact_question_fingerprint(qtext_raw)
+        if not norm or norm in existing:
+            continue
+        row = {
+            "exam": exam,
+            "subject": subject,
+            "chapter": chapter_db,
+            "question_text": qtext_raw.strip(),
+            "question_type": row_type,
+            "difficulty": diff_db,
+            "correct_answer": str(q["answer"]) if q.get("answer") is not None else None,
+            "explanation": str(q["explanation"]) if q.get("explanation") else None,
+        }
+        if row_type == "mcq" and q.get("options") is not None:
+            row["options"] = q["options"]
+        to_insert.append(row)
+        existing.add(norm)
+    if to_insert:
+        _sb_post("questions", to_insert)
 
-
-def _row_to_api_item(row, for_mixed_pool: bool):
-    (_id, _exam, _subj, _chapter, question_text, qtype, _diff,
-     options, correct_answer, explanation, _ts) = row
-    item = {
-        "question": question_text or "",
-        "answer": correct_answer if correct_answer is not None else "",
-        "explanation": explanation if explanation is not None else "",
-    }
-    if qtype == "mcq" and options is not None:
-        if isinstance(options, str):
-            item["options"] = json.loads(options)
-        else:
-            item["options"] = options
-    if for_mixed_pool:
-        item["question_type"] = qtype
-    return item
-
-
-def _db_question_type_filter(q_type: str):
-    if q_type == "mixed":
-        return "question_type IN ('mcq', 'short')", []
-    if q_type == "conceptual":
-        return "question_type = %s", ["long"]
-    return "question_type = %s", [q_type]
-
-
-def get_cached_questions(q_type, difficulty, subject, exam, chapter: str, limit,
-                         order: Literal["newest", "random"] = "newest"):
+def get_cached_questions(q_type, difficulty, subject, exam, chapter, limit):
     if limit <= 0:
         return []
     diff_db = _difficulty_for_db(difficulty)
-    order_sql = "ORDER BY RANDOM()" if order == "random" else "ORDER BY created_at DESC"
-    conn = get_db_connection()
+    chapter_db = chapter.strip() or None
+    params = {
+        "select": "question_text,question_type,correct_answer,explanation,options",
+        "exam": f"eq.{exam}",
+        "subject": f"eq.{subject}",
+        "difficulty": f"eq.{diff_db}",
+        "limit": limit,
+        "order": "created_at.desc",
+    }
+    if chapter_db:
+        params["chapter"] = f"eq.{chapter_db}"
+    else:
+        params["chapter"] = "is.null"
+    if q_type == "mixed":
+        params["question_type"] = "in.(mcq,short)"
+    elif q_type == "conceptual":
+        params["question_type"] = "eq.long"
+    else:
+        params["question_type"] = f"eq.{q_type}"
     try:
-        with conn.cursor() as cur:
-            type_sql, type_params = _db_question_type_filter(q_type)
-            chapter_clause = "chapter IS NOT DISTINCT FROM %s"
-            params = [exam, subject, chapter.strip() or None, diff_db] + type_params + [limit]
-            cur.execute(
-                f"""
-                SELECT id, exam, subject, chapter, question_text, question_type, difficulty,
-                       options, correct_answer, explanation, created_at
-                FROM questions
-                WHERE exam = %s AND subject = %s AND {chapter_clause}
-                  AND difficulty = %s AND ({type_sql})
-                {order_sql}
-                LIMIT %s
-                """,
-                params,
-            )
-            rows = cur.fetchall()
-    finally:
-        conn.close()
+        rows = _sb_get("questions", params)
+    except Exception:
+        return []
     for_mixed = q_type == "mixed"
-    return [_row_to_api_item(r, for_mixed) for r in rows]
+    result = []
+    for r in rows:
+        item = {
+            "question": r.get("question_text") or "",
+            "answer": r.get("correct_answer") or "",
+            "explanation": r.get("explanation") or "",
+        }
+        if r.get("question_type") == "mcq" and r.get("options"):
+            item["options"] = r["options"]
+        if for_mixed:
+            item["question_type"] = r.get("question_type")
+        result.append(item)
+    return result
 
+# ---------- PDF helpers ----------
 
 def extract_text(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
-    text = ""
-    for page in reader.pages:
-        text += page.extract_text() or ""
-    return text
-
+    return "".join(page.extract_text() or "" for page in reader.pages)
 
 def get_random_chunks(text, chunk_size=800, num_chunks=3):
-    chunks = [text[i: i + chunk_size] for i in range(0, len(text), chunk_size)]
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
     return " ".join(random.sample(chunks, min(num_chunks, len(chunks))))
 
+# ---------- Claude prompt config ----------
 
 FORMAT_EXAMPLES = {
-    "mcq": """[
-  {
-    "question": "string",
-    "options": {"A": "option text", "B": "option text", "C": "option text", "D": "option text"},
-    "answer": "A",
-    "explanation": "string"
-  }
-]""",
-    "short": """[
-  {"question": "string", "answer": "string", "explanation": "string"}
-]""",
-    "long": """[
-  {"question": "string", "answer": "string", "explanation": "string"}
-]""",
-    "conceptual": """[
-  {"question": "string", "answer": "string", "explanation": "string"}
-]""",
-    "mixed": """[
-  {"question_type": "mcq", "question": "string", "options": {"A": "...", "B": "...", "C": "...", "D": "..."}, "answer": "A", "explanation": "string"},
-  {"question_type": "short", "question": "string", "answer": "string", "explanation": "string"}
-]""",
+    "mcq": '[{"question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string"}]',
+    "short": '[{"question":"string","answer":"string","explanation":"string"}]',
+    "long": '[{"question":"string","answer":"string","explanation":"string"}]',
+    "conceptual": '[{"question":"string","answer":"string","explanation":"string"}]',
+    "mixed": '[{"question_type":"mcq","question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string"},{"question_type":"short","question":"string","answer":"string","explanation":"string"}]',
 }
-
 TYPE_RULES = {
-    "mcq": """
-Multiple choice ONLY.
-Each item MUST:
-- Have exactly 4 options labeled A, B, C, D
-- Have answer as a single letter: A, B, C, or D
-- Include question, options, correct_answer, explanation
-CRITICAL RULES:
-1. Do NOT modify or rephrase option text — only reorder options if needed.
-2. The correct answer position should be reasonably distributed across A, B, C, D.
-3. You MAY shuffle option order to change answer position.
-4. Ensure correct_answer always matches the correct option after shuffling.
-5. Return ONLY valid JSON. No markdown, no ```json, no extra text.
-""",
-    "short": """
-Short answer ONLY.
-Each item MUST include: question, answer (1–3 sentences), explanation.
-No options. No MCQ fields. Include key terms required for scoring marks.
-Return ONLY valid JSON array.
-""",
-    "long": """
-Long answer ONLY.
-Each item MUST include: question, answer (detailed), explanation.
-No options. Focus on "why", "how", conceptual understanding.
-Return ONLY valid JSON array.
-""",
-    "mixed": """
-Include a mix of MCQ and short questions.
-Each item MUST include: question_type ("mcq" or "short").
-MCQ: options (A–D), correct_answer. Short: answer text only.
-Return ONLY valid JSON array.
-""",
+    "mcq": "Multiple choice ONLY. 4 options A-D, answer is a single letter. Return ONLY valid JSON array.",
+    "short": "Short answer ONLY. Each item: question, answer (1-3 sentences), explanation. No options. Return ONLY valid JSON array.",
+    "long": "Long answer ONLY. Each item: question, answer (detailed paragraph), explanation. No options. Return ONLY valid JSON array.",
+    "mixed": "Mix of MCQ and short. Each item must have question_type field. Return ONLY valid JSON array.",
 }
+MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192}
 
-MAX_TOKENS_FOR_TYPE = {
-    "mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192,
-}
-
-
-def _strip_markdown_code_fence(text: str) -> str:
+def _strip_markdown_code_fence(text):
     t = text.strip()
     if not t.startswith("```"):
         return t
     lines = t.split("\n")
-    if lines and lines[0].startswith("```"):
+    if lines[0].startswith("```"):
         lines = lines[1:]
     while lines and lines[-1].strip() == "":
         lines.pop()
@@ -294,121 +203,48 @@ def _strip_markdown_code_fence(text: str) -> str:
         lines = lines[:-1]
     return "\n".join(lines).strip()
 
-
-def _extract_json_array_string(text: str) -> str | None:
+def _extract_json_array_string(text):
     s = _strip_markdown_code_fence(text)
     start = s.find("[")
     if start == -1:
         return None
-    depth = 0
-    in_str = False
-    i = start
-    n = len(s)
-    while i < n:
+    depth, in_str, i = 0, False, start
+    while i < len(s):
         ch = s[i]
         if in_str:
-            if ch == "\\" and i + 1 < n:
-                i += 2
-                continue
+            if ch == "\\" and i + 1 < len(s):
+                i += 2; continue
             if ch == '"':
                 in_str = False
-            i += 1
-            continue
-        if ch == '"':
+        elif ch == '"':
             in_str = True
-            i += 1
-            continue
-        if ch == "[":
+        elif ch == "[":
             depth += 1
         elif ch == "]":
             depth -= 1
             if depth == 0:
-                return s[start: i + 1]
+                return s[start:i+1]
         i += 1
     return None
 
-
-def _parse_ai_questions_json(raw: str, stop_reason: str | None) -> tuple[list | None, str | None]:
+def _parse_ai_questions_json(raw, stop_reason):
     json_str = _extract_json_array_string(raw)
     if not json_str:
         return None, "Could not find a JSON array in the model output."
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
-        hint = ""
-        if stop_reason == "max_tokens":
-            hint = (" Output was likely cut off at the token limit. Try fewer questions per request, "
-                     "or use short/MCQ types.")
+        hint = " Output may be cut off — try fewer questions." if stop_reason == "max_tokens" else ""
         return None, f"JSON parse error: {e}.{hint}"
     if not isinstance(data, list):
         return None, "Model output was not a JSON array."
     return data, None
 
-
-# --- Auth dependency ---
-
-_jwks_client = None
-
-
-def _get_jwks_client():
-    global _jwks_client
-    if _jwks_client is None:
-        jwks_url = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
-        _jwks_client = pyjwt.PyJWKClient(jwks_url, cache_keys=True)
-    return _jwks_client
-
-
-async def get_current_user(request: Request) -> dict:
-    """Verify Supabase JWT from Authorization header and return the user payload."""
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-
-    token = auth_header.split(" ", 1)[1]
-
-    try:
-        header = pyjwt.get_unverified_header(token)
-        alg = header.get("alg", "")
-    except pyjwt.exceptions.DecodeError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token header: {e}")
-
-    try:
-        if alg.startswith("HS"):
-            # Legacy HS256 shared secret
-            if not SUPABASE_JWT_SECRET:
-                raise HTTPException(status_code=500, detail="Server auth not configured")
-            payload = pyjwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                audience="authenticated",
-            )
-        else:
-            # ES256 / asymmetric keys — fetch public key from Supabase JWKS
-            if not SUPABASE_URL:
-                raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
-            jwks_client = _get_jwks_client()
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
-            payload = pyjwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["ES256", "ES384", "RS256", "EdDSA"],
-                audience="authenticated",
-            )
-    except pyjwt.exceptions.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
-    return payload
-
-# --- Public endpoints ---
+# ---------- API endpoints ----------
 
 @app.get("/api/health")
 async def health_check():
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0"
-    }
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/api/retrieve")
 async def retrieve_questions(
@@ -421,126 +257,49 @@ async def retrieve_questions(
     shuffle: Optional[str] = Query("false"),
 ):
     try:
-        conditions = []
-        params = []
-        if exam:
-            conditions.append("exam = %s"); params.append(exam)
-        if subject:
-            conditions.append("subject ILIKE %s"); params.append(f"%{subject}%")
-        if chapter:
-            conditions.append("chapter ILIKE %s"); params.append(f"%{chapter}%")
-        if difficulty:
-            conditions.append("difficulty = %s"); params.append(difficulty)
-        if q_type:
-            conditions.append("question_type = %s"); params.append(q_type)
-        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-        params.append(limit or 50)
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT id, exam, subject, chapter, question_text, question_type, difficulty, options, correct_answer, explanation, created_at FROM questions {where} ORDER BY created_at DESC LIMIT %s",
-                    params,
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-        questions_data = []
-        for row in rows:
-            opts = row[7]
-            if isinstance(opts, str):
-                try: opts = json.loads(opts)
-                except: pass
-            questions_data.append({
-                "id": row[0], "exam": row[1], "subject": row[2], "chapter": row[3],
-                "question": row[4], "question_type": row[5], "difficulty": row[6],
-                "options": opts, "answer": row[8], "explanation": row[9],
-                "created_at": row[10].isoformat() if row[10] else None,
-            })
+        params = {"select": "*", "limit": limit or 50, "order": "created_at.desc"}
+        if exam: params["exam"] = f"eq.{exam}"
+        if subject: params["subject"] = f"ilike.*{subject}*"
+        if chapter: params["chapter"] = f"ilike.*{chapter}*"
+        if difficulty: params["difficulty"] = f"eq.{difficulty}"
+        if q_type: params["question_type"] = f"eq.{q_type}"
+        rows = _sb_get("questions", params)
         if shuffle == "true":
-            random.shuffle(questions_data)
+            random.shuffle(rows)
+        questions_data = [{
+            "id": r.get("id"), "exam": r.get("exam"), "subject": r.get("subject"),
+            "chapter": r.get("chapter"), "question": r.get("question_text"),
+            "question_type": r.get("question_type"), "difficulty": r.get("difficulty"),
+            "options": r.get("options"), "answer": r.get("correct_answer"),
+            "explanation": r.get("explanation"), "created_at": r.get("created_at"),
+        } for r in rows]
         return {"success": True, "count": len(questions_data), "questions": questions_data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving questions: {str(e)}")
 
-@app.get("/api/subjects")
-async def get_subjects():
+@app.get("/api/stats")
+async def get_stats():
     try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT subject FROM questions WHERE subject IS NOT NULL ORDER BY subject")
-                subjects = [r[0] for r in cur.fetchall()]
-        finally:
-            conn.close()
-        return {"success": True, "subjects": subjects}
+        rows = _sb_get("questions", {"select": "exam,subject,chapter,question_type"})
+        counts = {}
+        for r in rows:
+            key = (r.get("exam"), r.get("subject"), r.get("chapter"), r.get("question_type"))
+            counts[key] = counts.get(key, 0) + 1
+        stats = [{"exam": k[0], "subject": k[1], "chapter": k[2], "question_type": k[3], "count": v} for k, v in counts.items()]
+        return {"success": True, "stats": stats}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/metadata")
 async def get_metadata():
     try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT exam FROM questions WHERE exam IS NOT NULL")
-                boards = sorted([r[0] for r in cur.fetchall()])
-                cur.execute("SELECT DISTINCT subject FROM questions WHERE subject IS NOT NULL")
-                subjects = sorted([r[0] for r in cur.fetchall()])
-                cur.execute("SELECT DISTINCT chapter FROM questions WHERE chapter IS NOT NULL")
-                chapters = sorted([r[0] for r in cur.fetchall()])
-        finally:
-            conn.close()
+        rows = _sb_get("questions", {"select": "exam,subject,chapter"})
+        boards = sorted({r["exam"] for r in rows if r.get("exam")})
+        subjects = sorted({r["subject"] for r in rows if r.get("subject")})
+        chapters = sorted({r["chapter"] for r in rows if r.get("chapter")})
         return {"success": True, "boards": boards, "subjects": subjects, "chapters": chapters}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/stats")
-async def get_stats():
-    try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT exam, subject, chapter, question_type, COUNT(*) FROM questions GROUP BY exam, subject, chapter, question_type ORDER BY exam, subject, chapter, question_type"
-                )
-                rows = cur.fetchall()
-        finally:
-            conn.close()
-        stats = [{"exam": r[0], "subject": r[1], "chapter": r[2], "question_type": r[3], "count": r[4]} for r in rows]
-        return {"success": True, "stats": stats}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/subjects/{board}")
-async def get_subjects_by_board(board: str):
-    try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT subject FROM questions WHERE exam = %s AND subject IS NOT NULL ORDER BY subject", (board,))
-                subjects = [r[0] for r in cur.fetchall()]
-        finally:
-            conn.close()
-        return {"success": True, "subjects": subjects}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/chapters/{board}/{subject}")
-async def get_chapters_by_board_subject(board: str, subject: str):
-    try:
-        conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT DISTINCT chapter FROM questions WHERE exam = %s AND subject = %s AND chapter IS NOT NULL ORDER BY chapter", (board, subject))
-                chapters = [r[0] for r in cur.fetchall()]
-        finally:
-            conn.close()
-        return {"success": True, "chapters": chapters}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# --- Admin-only endpoints (require auth) ---
 
 @app.post("/api/generate")
 async def generate_from_pdf(
@@ -552,30 +311,24 @@ async def generate_from_pdf(
     exam: str = Form("general"),
     chapter: str = Form(...),
 ):
-    """Generate questions from PDF using Claude API."""
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service key not configured")
     if num_q < 1:
         raise HTTPException(status_code=400, detail="num_q must be at least 1.")
     if not chapter or not chapter.strip():
         raise HTTPException(status_code=400, detail="chapter is required.")
-
 
     content = await file.read()
     try:
         text = extract_text(content)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
-
     if not text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="No text found in the PDF. Try a different file or one with selectable text.",
-        )
+        raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
     selected_content = get_random_chunks(text)
-
-    # Fetch existing question texts to avoid duplicates
     existing_questions = []
     try:
         existing = get_cached_questions(q_type, difficulty, subject, exam, chapter, 500)
@@ -583,82 +336,44 @@ async def generate_from_pdf(
     except Exception:
         pass
 
-    difficulty_map = {
-        "easy": "basic recall", "medium": "understanding and application",
-        "hard": "deep reasoning", "mixed": "mix of all levels",
-    }
-    type_map = {
-        "mcq": "multiple choice with 4 options (A–D), letter answer, explanation",
-        "short": "short answer (1–3 sentences per answer), no choices",
-        "long": "long-form paragraph answers, why/how conceptual answers (paragraph), no choices",
-        "mixed": "mix of MCQ and short-answer style items as in FORMAT",
-    }
+    difficulty_map = {"easy": "basic recall", "medium": "understanding and application", "hard": "deep reasoning", "mixed": "mix of all levels"}
+    type_map = {"mcq": "multiple choice with 4 options (A-D)", "short": "short answer (1-3 sentences)", "long": "long-form paragraph answers", "mixed": "mix of MCQ and short-answer"}
 
-    format_example = FORMAT_EXAMPLES[q_type]
-    type_rule = TYPE_RULES[q_type]
-    max_out = MAX_TOKENS_FOR_TYPE[q_type]
-
-    prompt = f"""
-You are a strict JSON generator.
+    prompt = f"""You are a strict JSON generator.
 
 Generate exactly {num_q} questions based ONLY on the CONTENT below.
+Question type: {q_type} — {type_map.get(q_type, q_type)}
+Difficulty: {difficulty_map.get(difficulty, difficulty)}
 
-User-selected question type: {q_type}
-Difficulty focus: {difficulty_map[difficulty]}
-Style: {type_map[q_type]}
+{TYPE_RULES.get(q_type, '')}
 
-CRITICAL — follow this type exactly:
-{type_rule}
-If the type is not "mcq", you MUST NOT output "options" or A/B/C/D choices.
+Do NOT reference figures, examples, tables, or page numbers from the PDF. Each question must be self-contained.
 
-RULES:
-- Return ONLY valid JSON (one array). Do NOT wrap in markdown code fences (no ```).
-- No markdown, no headings, no text outside the JSON array
-- The entire JSON must be complete and parseable — if you run out of space, shorten answers; never stop mid-quote or mid-string.
-- Do NOT reference specific examples, figures, diagrams, tables, or page numbers from the source material (e.g. "In Example 3..." or "As shown in Figure 2..."). Students will not have access to the PDF. Each question must be fully self-contained and understandable on its own.
-
-FORMAT (match this structure exactly for type "{q_type}"):
-
-{format_example}
+FORMAT:
+{FORMAT_EXAMPLES.get(q_type, '')}
 
 CONTENT:
-{selected_content}
-"""
+{selected_content}"""
 
     if existing_questions:
-        dedup_list = "\n".join(f"- {q}" for q in existing_questions)
-        prompt += f"""
-
-ALREADY GENERATED (do NOT repeat or rephrase these — generate completely NEW and DIFFERENT questions):
-{dedup_list}
-"""
+        prompt += "\n\nDO NOT repeat these questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
 
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=max_out,
+        max_tokens=MAX_TOKENS_FOR_TYPE[q_type],
         messages=[{"role": "user", "content": prompt}],
     )
 
     raw = response.content[0].text
     stop_reason = getattr(response, "stop_reason", None)
-    if stop_reason == "max_tokens":
-        logger.warning("Claude stopped at max_tokens; JSON may be incomplete (q_type=%s)", q_type)
-
     data, parse_err = _parse_ai_questions_json(raw, stop_reason)
     if parse_err:
-        err = {"error": parse_err, "raw": raw}
-        if stop_reason == "max_tokens":
-            err["hint"] = (
-                "Model hit the output limit. Try generating fewer questions at once, "
-                "or use short-answer / MCQ mode for this chapter."
-            )
-        return err
+        return {"error": parse_err, "raw": raw}
 
     try:
         save_questions(data, q_type, difficulty, subject, exam, chapter)
     except Exception as e:
-        logger.exception("Database error while saving questions")
         return {"questions": data, "save_warning": str(e)}
 
     return {"questions": data}
