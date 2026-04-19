@@ -4,6 +4,7 @@ import { supabase } from '../lib/supabase'
 import Dashboard from './Dashboard'
 import GenerateQuestions from './GenerateQuestions'
 import RetrieveQuestions from './RetrieveQuestions'
+import ExamPaperUploads from './ExamPaperUploads'
 
 export default function AdminDashboard() {
   const navigate = useNavigate()
@@ -31,6 +32,7 @@ export default function AdminDashboard() {
     { id: 'dashboard', label: 'Dashboard', icon: '\u2302' },
     { id: 'generate', label: 'Generate Questions', icon: '\u2B06' },
     { id: 'retrieve', label: 'Retrieve Questions', icon: '\u2B07' },
+    { id: 'exam-uploads', label: 'Exam Paper Uploads', icon: '\u{1F4C4}' },
   ]
 
   return (
@@ -73,6 +75,7 @@ export default function AdminDashboard() {
         {activeTab === 'dashboard' && <Dashboard />}
         {activeTab === 'generate' && <GenerateQuestions showStatus={showStatus} />}
         {activeTab === 'retrieve' && <RetrieveQuestions showStatus={showStatus} />}
+        {activeTab === 'exam-uploads' && <ExamPaperUploads showStatus={showStatus} />}
       </main>
     </div>
   )
