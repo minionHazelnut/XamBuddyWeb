@@ -24,7 +24,7 @@ CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("CLAU
 
 # ---------- Generate helpers ----------
 
-_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
+_DEFAULT_DATABASE_URL = "postgresql://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
 
 
 def _normalize_psycopg2_dsn(url: str) -> str:
