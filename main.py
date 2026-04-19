@@ -11,7 +11,6 @@ import re
 import random
 import logging
 from datetime import datetime
-from jose import jwt as jose_jwt, JWTError
 import jwt as pyjwt
 from pypdf import PdfReader
 import io
@@ -352,10 +351,6 @@ def _parse_ai_questions_json(raw: str, stop_reason: str | None) -> tuple[list | 
         return None, "Model output was not a JSON array."
     return data, None
 
-
-@app.on_event("startup")
-async def startup_event():
-    await init_db()
 
 # --- Auth dependency ---
 
