@@ -21,6 +21,31 @@ export default function ExamPaperRetrieve({ showStatus }) {
   const [year, setYear] = useState('')
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+
+  function storagePathFromUrl(url) {
+    if (!url) return null
+    const marker = '/pdf-uploads/'
+    const idx = url.indexOf(marker)
+    return idx !== -1 ? url.slice(idx + marker.length) : null
+  }
+
+  async function handleDelete(row) {
+    if (!window.confirm('Delete this record and its files permanently?')) return
+    setDeletingId(row.id)
+    try {
+      const paths = [storagePathFromUrl(row.exam_paper_pdf), storagePathFromUrl(row.answer_key_pdf)].filter(Boolean)
+      if (paths.length) await supabase.storage.from('pdf-uploads').remove(paths)
+      const { error } = await supabase.from('pdf_uploads').delete().eq('id', row.id)
+      if (error) throw error
+      setResults(prev => prev.filter(r => r.id !== row.id))
+      showStatus('Deleted successfully.', 'success')
+    } catch (err) {
+      showStatus(`Delete failed: ${err.message}`, 'error')
+    } finally {
+      setDeletingId(null)
+    }
+  }
 
   async function handleSearch(e) {
     e.preventDefault()
@@ -161,7 +186,7 @@ export default function ExamPaperRetrieve({ showStatus }) {
                       {row.board}{row.year ? ` · ${row.year}` : ''} · {row.exam_type === 'sample_paper' ? 'Sample Paper' : 'Board Exam'}
                     </div>
                   </div>
-                  <div style={{ display: 'flex', gap: '10px' }}>
+                  <div style={{ display: 'flex', gap: '10px', alignItems: 'center' }}>
                     {links.length > 0 ? links.map(link => (
                       <a
                         key={link.label}
@@ -179,6 +204,16 @@ export default function ExamPaperRetrieve({ showStatus }) {
                     )) : (
                       <span style={{ fontSize: '13px', color: '#aaa' }}>Not available</span>
                     )}
+                    <button
+                      onClick={() => handleDelete(row)}
+                      disabled={deletingId === row.id}
+                      style={{
+                        padding: '8px 14px', borderRadius: '8px', fontSize: '13px', fontWeight: '600',
+                        background: '#fff', border: '1px solid #e57373', color: '#c62828', cursor: 'pointer'
+                      }}
+                    >
+                      {deletingId === row.id ? 'Deleting...' : 'Delete'}
+                    </button>
                   </div>
                 </div>
               )

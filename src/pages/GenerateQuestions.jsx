@@ -22,6 +22,8 @@ export default function GenerateQuestions({ showStatus }) {
   const [difficulty, setDifficulty] = useState('easy')
   const [numQs, setNumQs] = useState(5)
   const [file, setFile] = useState(null)
+  const [existingPdfUrl, setExistingPdfUrl] = useState(null)
+  const [checkingPdf, setCheckingPdf] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [existingQuestions, setExistingQuestions] = useState([])
   const [newQuestions, setNewQuestions] = useState([])
@@ -30,15 +32,32 @@ export default function GenerateQuestions({ showStatus }) {
 
   const chapters = getChapters(exam, subject)
 
-  // Fetch existing questions when filters change
   useEffect(() => {
     if (exam && subject && chapter) {
       fetchExisting()
+      checkForExistingPdf()
     } else {
       setExistingQuestions([])
       setExistingCount(0)
+      setExistingPdfUrl(null)
     }
   }, [exam, subject, chapter, qType, difficulty])
+
+  async function checkForExistingPdf() {
+    setCheckingPdf(true)
+    const { grade, board } = parseExam(exam)
+    const { data } = await supabase
+      .from('pdf_uploads')
+      .select('chapter_pdf')
+      .eq('board', board)
+      .eq('grade', grade)
+      .eq('subject', subject)
+      .eq('chapter', chapter)
+      .not('chapter_pdf', 'is', null)
+      .limit(1)
+    setExistingPdfUrl(data?.[0]?.chapter_pdf || null)
+    setCheckingPdf(false)
+  }
 
   async function fetchExisting() {
     setLoadingExisting(true)
@@ -59,9 +78,43 @@ export default function GenerateQuestions({ showStatus }) {
     setLoadingExisting(false)
   }
 
+  function parseExam(examStr) {
+    const gradeMatch = examStr.match(/^(\d+th|\d+st|\d+nd|\d+rd)/i)
+    const grade = gradeMatch ? gradeMatch[1] : ''
+    const boardMatch = examStr.match(/(CBSE|ICSE|State)/i)
+    const board = boardMatch ? boardMatch[1].toUpperCase() : ''
+    return { grade, board }
+  }
+
+  async function uploadChapterPdf(grade, board) {
+    try {
+      const { data: existing } = await supabase
+        .from('pdf_uploads')
+        .select('id')
+        .eq('board', board)
+        .eq('grade', grade)
+        .eq('subject', subject)
+        .eq('chapter', chapter)
+        .not('chapter_pdf', 'is', null)
+        .limit(1)
+      if (existing && existing.length > 0) return
+
+      const fileName = `chapter-pdfs/${Date.now()}_${file.name}`
+      const { error: storageError } = await supabase.storage
+        .from('pdf-uploads')
+        .upload(fileName, file)
+      if (storageError) return
+      const { data: urlData } = supabase.storage.from('pdf-uploads').getPublicUrl(fileName)
+      await supabase.from('pdf_uploads').insert({
+        board, grade, subject, chapter,
+        chapter_pdf: urlData.publicUrl,
+      })
+    } catch {}
+  }
+
   async function handleGenerate(e) {
     e.preventDefault()
-    if (!file) {
+    if (!file && !existingPdfUrl) {
       showStatus('Please select a PDF file', 'error')
       return
     }
@@ -72,8 +125,17 @@ export default function GenerateQuestions({ showStatus }) {
     setGenerating(true)
     setNewQuestions([])
     try {
+      const { grade, board } = parseExam(exam)
+
+      let pdfFile = file
+      if (!pdfFile && existingPdfUrl) {
+        const res = await fetch(existingPdfUrl)
+        const blob = await res.blob()
+        pdfFile = new File([blob], 'chapter.pdf', { type: 'application/pdf' })
+      }
+
       const formData = new FormData()
-      formData.append('file', file)
+      formData.append('file', pdfFile)
       formData.append('exam', exam)
       formData.append('subject', subject)
       formData.append('chapter', chapter)
@@ -81,17 +143,28 @@ export default function GenerateQuestions({ showStatus }) {
       formData.append('difficulty', difficulty)
       formData.append('num_q', numQs)
 
-      const response = await fetch(`${API_BASE}/api/generate`, {
-        method: 'POST',
-        body: formData
-      })
-      const result = await response.json()
+      const [response] = await Promise.all([
+        fetch(`${API_BASE}/api/generate`, { method: 'POST', body: formData }),
+        uploadChapterPdf(grade, board),
+      ])
+
+      const text = await response.text()
+      if (!text) {
+        showStatus(`Server returned an empty response (status ${response.status})`, 'error')
+        return
+      }
+      let result
+      try {
+        result = JSON.parse(text)
+      } catch {
+        showStatus(`Server error: ${text.slice(0, 200)}`, 'error')
+        return
+      }
       if (result.error) {
         showStatus(`Failed: ${result.error}`, 'error')
       } else if (result.questions) {
         setNewQuestions(result.questions)
         showStatus(`Generated ${result.questions.length} new questions!`, 'success')
-        // Refresh existing questions to show updated count
         await fetchExisting()
       }
     } catch (err) {
@@ -108,14 +181,25 @@ export default function GenerateQuestions({ showStatus }) {
 
       <form onSubmit={handleGenerate} className="form-panel">
         <div className="form-group">
-          <label>Upload PDF File:</label>
-          <label className={`file-input-label ${file ? 'has-file' : ''}`} htmlFor="fileInput">
-            {file ? `Selected: ${file.name}` : 'Drag & drop PDF file here or click to browse'}
-          </label>
-          <input
-            type="file" id="fileInput" accept=".pdf" style={{ display: 'none' }}
-            onChange={(e) => setFile(e.target.files[0] || null)}
-          />
+          <label>PDF File:</label>
+          {checkingPdf ? (
+            <div className="file-input-label" style={{ color: '#6b8a80' }}>Checking database...</div>
+          ) : existingPdfUrl && !file ? (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', padding: '12px 14px', background: '#d4edda', border: '2px solid #28a745', borderRadius: '10px' }}>
+              <span style={{ flex: 1, fontSize: '14px', color: '#155724', fontWeight: '500' }}>Using saved PDF from database</span>
+              <button type="button" onClick={() => setExistingPdfUrl(null)} style={{ fontSize: '12px', color: '#155724', background: 'none', border: '1px solid #28a745', borderRadius: '6px', padding: '4px 10px', cursor: 'pointer' }}>Upload different PDF</button>
+            </div>
+          ) : (
+            <>
+              <label className={`file-input-label ${file ? 'has-file' : ''}`} htmlFor="fileInput">
+                {file ? `Selected: ${file.name}` : 'Drag & drop PDF file here or click to browse'}
+              </label>
+              <input
+                type="file" id="fileInput" accept=".pdf" style={{ display: 'none' }}
+                onChange={(e) => setFile(e.target.files[0] || null)}
+              />
+            </>
+          )}
         </div>
 
         <div className="form-row">

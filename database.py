@@ -7,7 +7,7 @@ import os
 # Database URL from environment variable, with fallback
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
-    "postgresql+asyncpg://postgres:xambuddypwd@139.59.93.35:5432/xambuddydb"
+    "postgresql+asyncpg://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
 )
 
 # Create async engine

@@ -31,7 +31,7 @@ CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("CLAU
 
 # ---------- Generate helpers ----------
 
-_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:xambuddypwd@139.59.93.35:5432/xambuddydb"
+_DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:surHak-wemhic-jibne1@db.klfekdsdosqpymxcikjw.supabase.co:5432/postgres"
 
 
 def _normalize_psycopg2_dsn(url: str) -> str:
@@ -43,7 +43,7 @@ def _normalize_psycopg2_dsn(url: str) -> str:
 def get_db_connection():
     raw = os.getenv("DATABASE_URL", _DEFAULT_DATABASE_URL)
     dsn = _normalize_psycopg2_dsn(raw.strip())
-    return psycopg2.connect(dsn)
+    return psycopg2.connect(dsn, sslmode="require")
 
 
 def _difficulty_for_db(difficulty: str) -> str:
@@ -590,11 +590,8 @@ async def generate_from_pdf(
     content = await file.read()
     try:
         text = extract_text(content)
-    except fitz.FileDataError:
-        raise HTTPException(
-            status_code=400,
-            detail="Could not read that file as a PDF. Upload a real PDF (not a Word/image file renamed to .pdf).",
-        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
     if not text.strip():
         raise HTTPException(
@@ -662,7 +659,7 @@ ALREADY GENERATED (do NOT repeat or rephrase these — generate completely NEW a
 {dedup_list}
 """
 
-    claude_client = anthropic.Anthropic()
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=max_out,
@@ -686,12 +683,9 @@ ALREADY GENERATED (do NOT repeat or rephrase these — generate completely NEW a
 
     try:
         save_questions(data, q_type, difficulty, subject, exam, chapter)
-    except (OperationalError, DatabaseError) as e:
+    except Exception as e:
         logger.exception("Database error while saving questions")
-        raise HTTPException(
-            status_code=503,
-            detail="Generated questions but could not save them. Try again later.",
-        ) from e
+        return {"questions": data, "save_warning": str(e)}
 
     return {"questions": data}
 
