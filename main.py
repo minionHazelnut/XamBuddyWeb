@@ -224,57 +224,117 @@ def truncate_text(text, max_chars=18000):
 # ---------- Claude prompt config ----------
 
 FORMAT_EXAMPLES = {
-    "mcq": '[{"question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string"}]',
-    "short": '[{"question":"string","answer":"string","explanation":"string"}]',
-    "long": '[{"question":"string","answer":"string","explanation":"string"}]',
-    "conceptual": '[{"question":"string","answer":"string","explanation":"string"}]',
-    "mixed": '[{"question_type":"mcq","question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string"},{"question_type":"short","question":"string","answer":"string","explanation":"string"}]',
-    "cbq": '[{"question_type":"cbq","passage":"60-100 word real-world/scenario passage","sub_questions":[{"question":"string","difficulty":"easy","answer":"string"},{"question":"string","difficulty":"medium","answer":"string"},{"question":"string","difficulty":"hard","answer":"string"}]}]',
+    "mcq": '[{"question":"Which of the following best describes X?","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"B","explanation":"Key terms: ...; This scores full marks because ..."}]',
+    "short": '[{"question":"Explain why X occurs.","answer":"[Context sentence.] [Core explanation in 1-2 sentences with all key terms.] [Implication or example sentence.]","explanation":"Keywords that earn marks: X, Y, Z"}]',
+    "long": '[{"question":"Analyse the significance of X in detail.","answer":"[Introduction sentence setting context.] [Core explanation covering all marking scheme sub-points, with all key terms.] [Diagram note if relevant: (include diagram of X here).] [Concluding sentence stating significance.]","explanation":"Marking scheme points: 1. ... 2. ... 3. ..."}]',
+    "conceptual": '[{"question":"How does X relate to Y?","answer":"[Introduction.] [Core explanation.] [Conclusion.]","explanation":"Marking scheme points: 1. ... 2. ..."}]',
+    "mixed": '[{"question_type":"mcq","question":"Which of the following is correct about X?","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"Key terms: ..."},{"question_type":"short","question":"Explain how X affects Y.","answer":"[Context.] [Explanation.] [Example.]","explanation":"Keywords: X, Y, Z"}]',
+    "cbq": '[{"question_type":"cbq","passage":"[60-100 word real-world/current-affairs scenario derived from chapter content, NO direct copy from PDF]","sub_questions":[{"question":"What is X? [easy]","difficulty":"easy","answer":"[Direct recall answer, max 100 words]"},{"question":"Why does X happen? [medium]","difficulty":"medium","answer":"[Understanding-level answer, max 100 words]"},{"question":"Analyse how X impacts Y. [hard]","difficulty":"hard","answer":"[Analytical answer, max 100 words]"}]}]',
 }
 
+# Subject-level practical/theory defaults (Section B, Step 1)
+SUBJECT_PRACTICAL_PCT = {
+    "Mathematics": 92, "Physics": 60, "Chemistry": 50, "Biology": 15,
+    "Accountancy": 85, "Business Studies": 20,
+    "History": 10, "Political Science": 10, "Geography": 15,
+    "Sociology": 10, "English": 10, "Hindi": 10,
+    "Economics": 30,
+}
+
+def _practical_theory_instruction(subject: str) -> str:
+    pct = SUBJECT_PRACTICAL_PCT.get(subject, None)
+    if pct is None:
+        return "Determine the practical vs theory split entirely from the chapter content. Practical questions involve calculations, data interpretation, numerical problems, graphs, or applied problem-solving. Theory questions involve explanations, definitions, concepts, and reasoning."
+    theory_pct = 100 - pct
+    return f"For {subject}: generate approximately {pct}% practical questions (calculations, numerical problems, applied problem-solving, data interpretation) and {theory_pct}% theory questions (definitions, explanations, concepts, reasoning). Override this ratio only if the chapter content clearly has a different balance."
+
 TYPE_RULES = {
-    "mcq": """MCQ rules (follow strictly):
-- Easy MCQs: surface-level factual, direct recall, one-line definitions, who/what/which questions. Distractors plausible but clearly wrong to a student who has studied.
-- Medium MCQs: require understanding and application. Student must think, not just recall. Apply concept to a scenario, identify the correct process, choose between similar-sounding concepts.
-- Hard MCQs: conceptual depth. Why does X happen, which best explains, how does X relate to Y. Distractors must be very close to the correct answer and require genuine understanding to differentiate.
-- Generate 4 options labelled A, B, C, D for every MCQ.
-- Distribute correct answers equally across A, B, C, D — no single option should be correct more than 30% of the time across the set.
-- answer field must be a single letter: A, B, C, or D.
-- Return ONLY a valid JSON array.""",
+    "mcq": """MCQ GENERATION RULES — follow every rule strictly:
 
-    "short": """Short Answer (SA) rules (follow strictly):
-- Every question must begin with: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when, or a similar prompt that demands explanation.
-- NO one-word or one-line answer questions allowed.
-- Answer format (40–70 words, complete sentences): one sentence of context → one to two sentences of core explanation → one sentence of implication or example if applicable.
-- Include all key terms a CBSE examiner would look for in the answer.
-- explanation field: note what keywords/concepts make this answer score full marks.
-- Return ONLY a valid JSON array.""",
+EASY MCQs — surface-level factual recall:
+  - Test direct recall: one-line definitions, "who discovered", "what is the formula for", "which of the following is correct about X"
+  - Correct answer must be unambiguous
+  - Distractors must be plausible but clearly wrong to any student who has studied the chapter
 
-    "long": """Long Answer (LA) rules (follow strictly):
-- Questions must use: why, how, explain in detail, analyse, discuss, compare, evaluate.
-- Answer structure (max 120 words, complete paragraphs): proper introduction sentence setting context → core explanation covering every sub-point a CBSE marking scheme awards marks for → concluding sentence summarising or stating significance.
-- All keywords an examiner would look for must appear throughout introduction, body, and conclusion.
-- Note "[include diagram of X here]" in the answer where a diagram is relevant.
-- explanation field: list the key points that would earn marks in a CBSE marking scheme.
-- Return ONLY a valid JSON array.""",
+MEDIUM MCQs — understanding and application:
+  - Student must think, not just recall
+  - Types: apply a concept to a scenario, identify the correct process, choose between two similar-sounding concepts
+  - No trivially easy or trivially hard questions at this level
 
-    "conceptual": """Conceptual/Long Answer rules (follow strictly):
-- Same rules as Long Answer above.
-- Focus on why/how/analyse/evaluate/discuss prompts requiring deep understanding.
-- Max 120 words per answer. Structured paragraph format.
-- Return ONLY a valid JSON array.""",
+HARD MCQs — conceptual depth:
+  - Use: "why does X happen", "which of the following best explains", "how does X relate to Y", "what would happen if"
+  - Distractors must be very close to the correct answer — genuine understanding required to differentiate
 
-    "mixed": """Mixed (MCQ + Short Answer) rules:
-- Each item must have a question_type field set to either "mcq" or "short".
-- Follow MCQ rules exactly for mcq items.
-- Follow Short Answer rules exactly for short items.
-- Return ONLY a valid JSON array.""",
+ALL MCQs:
+  - Exactly 4 options labelled A, B, C, D — no more, no less
+  - Distribute correct answers across A, B, C, D — no single option correct more than 30% of the time across the full set — randomise this
+  - "answer" field must be a single uppercase letter: A, B, C, or D
+  - "explanation" field: state which key terms/concepts make this the correct answer and why each distractor is wrong""",
 
-    "cbq": """Case-Based Question (CBQ) rules (follow strictly):
-- Each CBQ must have: a passage of 60–100 words based on a real-world application, current affairs hook, or scenario derived from the chapter content.
-- 3 sub-questions progressing in difficulty: first easy (direct recall from passage), second medium (requires understanding), third hard (requires analysis or application beyond the passage).
-- Each sub-question answer must not exceed 100 words.
-- Return ONLY a valid JSON array.""",
+    "short": """SHORT ANSWER (SA) GENERATION RULES — follow every rule strictly:
+
+QUESTION RULES:
+  - Every question MUST begin with one of: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when — or equivalent explanation-demanding prompt
+  - FORBIDDEN: questions with a one-word or one-line answer
+  - Include a mix of easy (recall-based), medium (application), and hard (analytical) questions
+
+ANSWER RULES — strictly 40 to 70 words per answer:
+  - Written in complete sentences only
+  - Structure: (1) one sentence of context setting the topic → (2) one to two sentences of core explanation containing ALL key terms a CBSE examiner looks for → (3) one sentence of implication, significance, or example
+  - Every answer must contain at least 3 domain-relevant keywords
+  - Answers must be written so a student who memorises them scores full marks in CBSE exams
+
+"explanation" field: list the specific keywords and sub-points that earn marks in a CBSE marking scheme""",
+
+    "long": """LONG ANSWER (LA) GENERATION RULES — follow every rule strictly:
+
+QUESTION RULES:
+  - Questions MUST use: why, how, explain in detail, analyse, discuss, compare, evaluate
+  - Questions must demand paragraph-level thinking and deep understanding
+
+ANSWER RULES — strictly max 120 words, structured paragraph format:
+  - STRUCTURE (mandatory):
+      → Introduction: one proper sentence setting context for the answer
+      → Body: core explanation covering ALL sub-points a CBSE marking scheme would award marks for; include every keyword an examiner looks for
+      → Conclusion: one sentence summarising or stating the significance
+  - If a diagram or table is relevant, note it as: (include diagram of X here)
+  - Every answer must contain at least 6 domain-relevant keywords
+  - Answers must be written so a student who memorises them scores full marks in CBSE exams
+
+"explanation" field: list all marking scheme points (e.g. "1. definition of X — 1 mark; 2. process of Y — 2 marks")""",
+
+    "conceptual": """CONCEPTUAL / LONG ANSWER GENERATION RULES — same as Long Answer, follow every rule:
+
+QUESTION RULES:
+  - Use: why, how, analyse, evaluate, discuss — demand deep conceptual understanding
+  - No surface-level or recall-based questions
+
+ANSWER RULES — max 120 words, structured paragraphs:
+  - Introduction → Body (all key sub-points + keywords) → Conclusion
+  - Minimum 6 domain-relevant keywords
+  - Note diagrams where relevant: (include diagram of X here)
+
+"explanation" field: list marking scheme points""",
+
+    "mixed": """MIXED (MCQ + SHORT ANSWER) GENERATION RULES:
+  - Each item MUST have "question_type" set to either "mcq" or "short"
+  - Roughly half MCQ, half short answer
+  - Apply ALL MCQ rules exactly for question_type="mcq" items
+  - Apply ALL Short Answer rules exactly for question_type="short" items""",
+
+    "cbq": """CASE-BASED QUESTION (CBQ) GENERATION RULES — follow every rule strictly:
+
+PASSAGE RULES:
+  - 60 to 100 words exactly
+  - Must be based on a real-world application, current affairs hook, or scenario DERIVED from the chapter content
+  - Must NOT directly copy text from the PDF — reframe in new words as a scenario
+
+SUB-QUESTION RULES — exactly 3 sub-questions per CBQ:
+  - Sub-question 1 (easy): direct recall from the passage
+  - Sub-question 2 (medium): requires understanding and application
+  - Sub-question 3 (hard): requires analysis, evaluation, or application beyond the passage
+  - Each sub-question answer: max 100 words, complete sentences, all relevant keywords present
+  - Total CBQ carries 4 marks""",
 }
 
 MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192, "cbq": 8192}
@@ -428,38 +488,78 @@ async def generate_from_pdf(
         pass
 
     difficulty_map = {
-        "easy": "Easy — surface-level factual, direct recall, definitions",
-        "medium": "Medium — understanding and application, requires thinking not just recall",
-        "hard": "Hard — deep reasoning, analytical, conceptual, multi-step",
-        "mixed": "Mixed — distribute equally across easy, medium, and hard",
+        "easy":   "EASY — test surface-level factual recall and direct definitions only",
+        "medium": "MEDIUM — test understanding and application; student must think, not just recall",
+        "hard":   "HARD — test deep reasoning, conceptual analysis, multi-step thinking",
+        "mixed":  "MIXED — distribute questions equally across easy, medium, and hard difficulty levels",
     }
 
-    prompt = f"""You are an expert CBSE question paper setter generating questions for Class 10/12 students.
+    practical_theory_rule = _practical_theory_instruction(subject)
 
-SUBJECT: {subject}
-CHAPTER: {chapter}
-EXAM: {exam}
-QUESTION TYPE: {q_type}
-DIFFICULTY: {difficulty_map.get(difficulty, difficulty)}
-NUMBER OF QUESTIONS TO GENERATE: {num_q}
+    prompt = f"""You are a senior CBSE question paper setter with 20 years of experience writing board exam papers for Class 10 and Class 12 students in India. You set questions for the subject {subject}.
 
-RULES FOR THIS QUESTION TYPE:
+═══════════════════════════════════════════════
+TASK PARAMETERS
+═══════════════════════════════════════════════
+Subject      : {subject}
+Chapter      : {chapter}
+Exam         : {exam}
+Question Type: {q_type.upper()}
+Difficulty   : {difficulty_map.get(difficulty, difficulty)}
+Count        : Generate exactly {num_q} question(s)
+
+═══════════════════════════════════════════════
+STEP 1 — CHAPTER ANALYSIS (do this mentally before generating)
+═══════════════════════════════════════════════
+Before generating any question:
+1. Read the entire CHAPTER CONTENT below thoroughly.
+2. Identify all major headings, sub-headings, key concepts, definitions, formulas, examples, and case studies.
+3. Determine the practical vs theory split of this chapter.
+   {practical_theory_rule}
+4. Divide the chapter into logical segments. You must generate questions proportionally from EVERY segment — do NOT cluster questions around the introduction or any single section. Every major heading must be represented by at least one question in the final output.
+
+═══════════════════════════════════════════════
+STEP 2 — QUESTION TYPE RULES
+═══════════════════════════════════════════════
 {TYPE_RULES.get(q_type, '')}
 
-COVERAGE RULE: Generate questions proportionally from across the ENTIRE chapter content below. Do NOT concentrate questions on the introduction or any single section. Identify all major topics/headings in the content and ensure each is represented.
+═══════════════════════════════════════════════
+STEP 3 — UNIVERSAL QUALITY STANDARDS (Section D)
+═══════════════════════════════════════════════
+Every single question and answer you generate MUST pass ALL of the following checks:
 
-ANSWER QUALITY RULE: Every answer must include all important keywords that CBSE examiners look for. Answers must be written in complete sentences such that a student who memorises them will score full marks in any school, board, or competitive exam on this topic.
+QUESTION CHECKS:
+✓ Question text must end with a question mark OR be a clear instruction (Explain..., Analyse..., Describe...)
+✓ Question must be fully self-contained — do NOT reference "the figure above", "Table 2", "as shown", "Example 3", or any page/section numbers from the PDF
+✓ Question must be derivable from and answerable using the chapter content provided
 
-SELF-CONTAINED RULE: Do NOT reference figures, tables, examples by number, or page numbers from the PDF. Every question and answer must be fully self-contained.
+ANSWER CHECKS:
+✓ Answer must NOT be empty
+✓ For SA and LA: answer must NOT be a single word or single sentence — full structured answer required
+✓ SA answers: minimum 3 domain-relevant keywords from the chapter
+✓ LA/Conceptual answers: minimum 6 domain-relevant keywords from the chapter
+✓ All answers must be written in complete sentences
+✓ Answers must be written such that a student who memorises them will score FULL MARKS in any CBSE school exam, board exam, or competitive exam on this topic
 
-OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
+MCQ-SPECIFIC CHECKS:
+✓ Exactly 4 options labelled A, B, C, D — no more, no less
+✓ Exactly one correct answer stored in the "answer" field as a single uppercase letter
+✓ Correct answers distributed across A, B, C, D — no option correct more than 30% of the time
+
+═══════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════
+Return ONLY a valid JSON array. No preamble, no explanation, no markdown, no code fences. Just the raw JSON array.
+Example format:
 {FORMAT_EXAMPLES.get(q_type, '')}
 
-CHAPTER CONTENT:
+═══════════════════════════════════════════════
+CHAPTER CONTENT
+═══════════════════════════════════════════════
 {full_text}"""
 
     if existing_questions:
-        prompt += "\n\nDO NOT repeat or closely paraphrase any of these existing questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
+        prompt += "\n\n═══════════════════════════════════════════════\nDO NOT REPEAT — existing questions for this chapter (skip any question with >80% similarity to these):\n═══════════════════════════════════════════════\n" + "\n".join(f"- {q}" for q in existing_questions)
 
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
