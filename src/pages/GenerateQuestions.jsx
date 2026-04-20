@@ -236,6 +236,7 @@ export default function GenerateQuestions({ showStatus }) {
               <option value="long">Long Answer</option>
               <option value="conceptual">Conceptual</option>
               <option value="mixed">Mixed</option>
+              <option value="cbq">Case-Based (CBQ)</option>
             </select>
           </div>
           <div className="form-group">

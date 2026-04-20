@@ -59,8 +59,8 @@ def _difficulty_for_db(difficulty: str) -> str:
     return "medium" if difficulty == "mixed" else difficulty
 
 def _question_type_for_db(q_type: str, item: dict) -> str:
-    if q_type == "mixed":
-        return item.get("question_type") or "short"
+    if q_type in ("mixed", "cbq"):
+        return item.get("question_type") or q_type
     if q_type == "conceptual":
         return "long"
     return q_type
@@ -70,6 +70,12 @@ def _exact_question_fingerprint(text: str) -> str:
     return re.sub(r"\s+", " ", s)
 
 def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
+    # CBQ items are structured differently
+    if row_type == "cbq":
+        passage = (q.get("passage") or "").strip()
+        subs = q.get("sub_questions")
+        return len(passage) >= 20 and isinstance(subs, list) and len(subs) >= 1
+
     qt = (q.get("question") or "").strip()
     if len(qt) < 3 or qt[0] in "[{" or "```" in qt:
         return False
@@ -78,8 +84,19 @@ def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
         return False
     if row_type == "mcq":
         opts = q.get("options")
-        if not isinstance(opts, dict) or len(opts) < 2:
+        if not isinstance(opts, dict) or len(opts) < 4:
             return False
+        ans = (q.get("answer") or "").strip().upper()
+        if ans not in ("A", "B", "C", "D"):
+            return False
+    if row_type in ("short", "long", "conceptual"):
+        ans = (q.get("answer") or "").strip()
+        if len(ans) < 20:
+            return False
+    if not qt.endswith("?"):
+        qt_stripped = qt.rstrip(".!:;")
+        if not qt_stripped.endswith("?") and not any(qt.lower().startswith(w) for w in ("explain", "describe", "discuss", "analyse", "analyze", "compare", "evaluate", "differentiate", "why", "how", "what")):
+            pass
     return True
 
 def _get_existing_fingerprints(exam, subject, chapter_db):
@@ -105,8 +122,32 @@ def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
     existing = _get_existing_fingerprints(exam, subject, chapter_db)
     to_insert = []
     for q in questions:
-        qtext_raw = q.get("question") or ""
         row_type = _question_type_for_db(q_type, q)
+
+        # CBQ: store passage as question_text, sub_questions in options JSON
+        if row_type == "cbq":
+            if not _ai_item_is_clean_for_db(q, row_type):
+                continue
+            passage = (q.get("passage") or "").strip()
+            norm = _exact_question_fingerprint(passage)
+            if not norm or norm in existing:
+                continue
+            row = {
+                "exam": exam,
+                "subject": subject,
+                "chapter": chapter_db,
+                "question_text": passage,
+                "question_type": "cbq",
+                "difficulty": diff_db,
+                "correct_answer": None,
+                "explanation": None,
+                "options": {"sub_questions": q.get("sub_questions", [])},
+            }
+            to_insert.append(row)
+            existing.add(norm)
+            continue
+
+        qtext_raw = q.get("question") or ""
         if not _ai_item_is_clean_for_db(q, row_type):
             continue
         norm = _exact_question_fingerprint(qtext_raw)
@@ -177,9 +218,8 @@ def extract_text(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes))
     return "".join(page.extract_text() or "" for page in reader.pages)
 
-def get_random_chunks(text, chunk_size=800, num_chunks=3):
-    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
-    return " ".join(random.sample(chunks, min(num_chunks, len(chunks))))
+def truncate_text(text, max_chars=18000):
+    return text[:max_chars] if len(text) > max_chars else text
 
 # ---------- Claude prompt config ----------
 
@@ -189,14 +229,55 @@ FORMAT_EXAMPLES = {
     "long": '[{"question":"string","answer":"string","explanation":"string"}]',
     "conceptual": '[{"question":"string","answer":"string","explanation":"string"}]',
     "mixed": '[{"question_type":"mcq","question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string"},{"question_type":"short","question":"string","answer":"string","explanation":"string"}]',
+    "cbq": '[{"question_type":"cbq","passage":"60-100 word real-world/scenario passage","sub_questions":[{"question":"string","difficulty":"easy","answer":"string"},{"question":"string","difficulty":"medium","answer":"string"},{"question":"string","difficulty":"hard","answer":"string"}]}]',
 }
+
 TYPE_RULES = {
-    "mcq": "Multiple choice ONLY. 4 options A-D, answer is a single letter. Return ONLY valid JSON array.",
-    "short": "Short answer ONLY. Each item: question, answer (1-3 sentences), explanation. No options. Return ONLY valid JSON array.",
-    "long": "Long answer ONLY. Each item: question, answer (detailed paragraph), explanation. No options. Return ONLY valid JSON array.",
-    "mixed": "Mix of MCQ and short. Each item must have question_type field. Return ONLY valid JSON array.",
+    "mcq": """MCQ rules (follow strictly):
+- Easy MCQs: surface-level factual, direct recall, one-line definitions, who/what/which questions. Distractors plausible but clearly wrong to a student who has studied.
+- Medium MCQs: require understanding and application. Student must think, not just recall. Apply concept to a scenario, identify the correct process, choose between similar-sounding concepts.
+- Hard MCQs: conceptual depth. Why does X happen, which best explains, how does X relate to Y. Distractors must be very close to the correct answer and require genuine understanding to differentiate.
+- Generate 4 options labelled A, B, C, D for every MCQ.
+- Distribute correct answers equally across A, B, C, D — no single option should be correct more than 30% of the time across the set.
+- answer field must be a single letter: A, B, C, or D.
+- Return ONLY a valid JSON array.""",
+
+    "short": """Short Answer (SA) rules (follow strictly):
+- Every question must begin with: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when, or a similar prompt that demands explanation.
+- NO one-word or one-line answer questions allowed.
+- Answer format (40–70 words, complete sentences): one sentence of context → one to two sentences of core explanation → one sentence of implication or example if applicable.
+- Include all key terms a CBSE examiner would look for in the answer.
+- explanation field: note what keywords/concepts make this answer score full marks.
+- Return ONLY a valid JSON array.""",
+
+    "long": """Long Answer (LA) rules (follow strictly):
+- Questions must use: why, how, explain in detail, analyse, discuss, compare, evaluate.
+- Answer structure (max 120 words, complete paragraphs): proper introduction sentence setting context → core explanation covering every sub-point a CBSE marking scheme awards marks for → concluding sentence summarising or stating significance.
+- All keywords an examiner would look for must appear throughout introduction, body, and conclusion.
+- Note "[include diagram of X here]" in the answer where a diagram is relevant.
+- explanation field: list the key points that would earn marks in a CBSE marking scheme.
+- Return ONLY a valid JSON array.""",
+
+    "conceptual": """Conceptual/Long Answer rules (follow strictly):
+- Same rules as Long Answer above.
+- Focus on why/how/analyse/evaluate/discuss prompts requiring deep understanding.
+- Max 120 words per answer. Structured paragraph format.
+- Return ONLY a valid JSON array.""",
+
+    "mixed": """Mixed (MCQ + Short Answer) rules:
+- Each item must have a question_type field set to either "mcq" or "short".
+- Follow MCQ rules exactly for mcq items.
+- Follow Short Answer rules exactly for short items.
+- Return ONLY a valid JSON array.""",
+
+    "cbq": """Case-Based Question (CBQ) rules (follow strictly):
+- Each CBQ must have: a passage of 60–100 words based on a real-world application, current affairs hook, or scenario derived from the chapter content.
+- 3 sub-questions progressing in difficulty: first easy (direct recall from passage), second medium (requires understanding), third hard (requires analysis or application beyond the passage).
+- Each sub-question answer must not exceed 100 words.
+- Return ONLY a valid JSON array.""",
 }
-MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192}
+
+MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192, "cbq": 8192}
 
 def _strip_markdown_code_fence(text):
     t = text.strip()
@@ -315,7 +396,7 @@ async def get_metadata():
 async def generate_from_pdf(
     file: UploadFile = File(...),
     difficulty: Literal["easy", "medium", "hard", "mixed"] = Form(...),
-    q_type: Literal["mcq", "short", "long", "conceptual", "mixed"] = Form(...),
+    q_type: Literal["mcq", "short", "long", "conceptual", "mixed", "cbq"] = Form(...),
     num_q: int = Form(...),
     subject: str = Form("general"),
     exam: str = Form("general"),
@@ -338,7 +419,7 @@ async def generate_from_pdf(
     if not text.strip():
         raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
-    selected_content = get_random_chunks(text)
+    full_text = truncate_text(text)
     existing_questions = []
     try:
         existing = get_cached_questions(q_type, difficulty, subject, exam, chapter, 500)
@@ -346,27 +427,39 @@ async def generate_from_pdf(
     except Exception:
         pass
 
-    difficulty_map = {"easy": "basic recall", "medium": "understanding and application", "hard": "deep reasoning", "mixed": "mix of all levels"}
-    type_map = {"mcq": "multiple choice with 4 options (A-D)", "short": "short answer (1-3 sentences)", "long": "long-form paragraph answers", "mixed": "mix of MCQ and short-answer"}
+    difficulty_map = {
+        "easy": "Easy — surface-level factual, direct recall, definitions",
+        "medium": "Medium — understanding and application, requires thinking not just recall",
+        "hard": "Hard — deep reasoning, analytical, conceptual, multi-step",
+        "mixed": "Mixed — distribute equally across easy, medium, and hard",
+    }
 
-    prompt = f"""You are a strict JSON generator.
+    prompt = f"""You are an expert CBSE question paper setter generating questions for Class 10/12 students.
 
-Generate exactly {num_q} questions based ONLY on the CONTENT below.
-Question type: {q_type} — {type_map.get(q_type, q_type)}
-Difficulty: {difficulty_map.get(difficulty, difficulty)}
+SUBJECT: {subject}
+CHAPTER: {chapter}
+EXAM: {exam}
+QUESTION TYPE: {q_type}
+DIFFICULTY: {difficulty_map.get(difficulty, difficulty)}
+NUMBER OF QUESTIONS TO GENERATE: {num_q}
 
+RULES FOR THIS QUESTION TYPE:
 {TYPE_RULES.get(q_type, '')}
 
-Do NOT reference figures, examples, tables, or page numbers from the PDF. Each question must be self-contained.
+COVERAGE RULE: Generate questions proportionally from across the ENTIRE chapter content below. Do NOT concentrate questions on the introduction or any single section. Identify all major topics/headings in the content and ensure each is represented.
 
-FORMAT:
+ANSWER QUALITY RULE: Every answer must include all important keywords that CBSE examiners look for. Answers must be written in complete sentences such that a student who memorises them will score full marks in any school, board, or competitive exam on this topic.
+
+SELF-CONTAINED RULE: Do NOT reference figures, tables, examples by number, or page numbers from the PDF. Every question and answer must be fully self-contained.
+
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
 {FORMAT_EXAMPLES.get(q_type, '')}
 
-CONTENT:
-{selected_content}"""
+CHAPTER CONTENT:
+{full_text}"""
 
     if existing_questions:
-        prompt += "\n\nDO NOT repeat these questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
+        prompt += "\n\nDO NOT repeat or closely paraphrase any of these existing questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
 
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
