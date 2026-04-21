@@ -819,8 +819,6 @@ async def extract_paper(
 
     prompt = f"""You are an expert CBSE question paper analyser. Extract every single question from the question paper below. Do not miss any question.
 
-MULTI-LINE QUESTION RULE: Many questions span multiple lines or have sub-parts. Treat the entire question — including all its lines, clauses, and sub-parts — as a single question_text. Never split one question across multiple entries just because it has line breaks.
-
 PAPER DETAILS:
 Subject: {subject}
 Class: {class_level}
@@ -828,29 +826,51 @@ Board: {board}
 Year: {year}
 Exam Type: {exam_type}
 
-QUESTION TYPE DETECTION RULES (follow strictly):
-- MCQ: has four options labelled A B C D or 1 2 3 4
-- VSA (Very Short Answer): carries 2 marks
-- SA (Short Answer): carries 3 marks
-- LA (Long Answer): carries 5 marks
-- CBQ (Case Based Question): has a passage followed by sub-questions, carries 4 marks total
+═══ QUESTION TYPE RULES ═══
 
-DIFFICULTY TAGGING RULES:
-- easy: factual recall, definition-based, direct questions
-- medium: application-based, requires some understanding
-- hard: conceptual, why/how/which, multi-step reasoning, analytical
+MCQ — Multiple Choice Question
+  - Has four options labelled A/B/C/D or (a)/(b)/(c)/(d) or 1/2/3/4
+  - Typically 1 mark
+  - question_text = the question stem only (not the options)
+  - options = {{"A":"...","B":"...","C":"...","D":"..."}}
 
-For each question extract:
-- question_number: the number as it appears in the paper
-- question_text: the FULL question text including all sub-parts
-- question_type: one of MCQ, VSA, SA, LA, CBQ
-- marks: integer marks for this question
-- options: for MCQs only, object with keys A B C D — null for all other types
-- chapter: the chapter name if identifiable from context, otherwise null
-- difficulty_level: easy, medium, or hard
+VSA — Very Short Answer
+  - No options, typically 2 marks
+  - question_text = full question including all its lines
 
-OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
-[{{"question_number":"1","question_text":"full question text","question_type":"MCQ","marks":1,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}}]
+SA — Short Answer
+  - No options, typically 3 marks
+  - question_text = full question including all its lines
+
+LA — Long Answer
+  - No options, typically 5 marks
+  - question_text = full question including all its lines
+
+CBQ — Case-Based Question  ⚠️ SPECIAL HANDLING ⚠️
+  - Starts with a reading passage / case study / data table / graph description
+  - Followed by numbered sub-questions (i), (ii), (iii), (iv) etc.
+  - DO NOT create separate entries for each sub-question
+  - DO NOT put the passage text in question_text and sub-questions in options
+  - INSTEAD:
+      question_text = ONLY the passage/stimulus text (everything before the sub-questions begin)
+      options = {{"sub_questions": [{{"number":"i","text":"sub-question text here","marks":1}}, ...]}}
+      marks = total marks for the entire CBQ block
+  - If you cannot identify a clear passage but see grouped sub-questions under one number, still treat the whole block as one CBQ entry
+
+MULTI-PART NON-CBQ RULE: For SA/LA questions with (a)(b)(c) sub-parts that are NOT preceded by a passage, treat the entire question as one entry with all sub-parts in question_text.
+
+═══ DIFFICULTY RULES ═══
+- easy: factual recall, direct definition, one-step
+- medium: application, requires understanding
+- hard: analytical, multi-step, why/how/evaluate
+
+═══ OUTPUT FORMAT ═══
+Return ONLY a valid JSON array, no other text:
+[
+  {{"question_number":"1","question_text":"...","question_type":"MCQ","marks":1,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}},
+  {{"question_number":"5","question_text":"passage text only","question_type":"CBQ","marks":5,"options":{{"sub_questions":[{{"number":"i","text":"What is...","marks":1}},{{"number":"ii","text":"Explain...","marks":2}}]}},"chapter":null,"difficulty_level":"medium"}},
+  {{"question_number":"7","question_text":"full question text","question_type":"LA","marks":5,"options":null,"chapter":null,"difficulty_level":"hard"}}
+]
 
 QUESTION PAPER:
 {full_text}"""

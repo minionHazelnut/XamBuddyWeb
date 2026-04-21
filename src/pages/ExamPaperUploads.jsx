@@ -314,23 +314,53 @@ export default function ExamPaperUploads({ showStatus }) {
         {loadingQuestions ? <p>Loading questions...</p> : (
           <div>
             <p style={{ color: '#6b8a80', marginBottom: '12px' }}>{paperQuestions.length} questions</p>
-            {paperQuestions.map((q, i) => (
-              <div key={q.id} className="form-panel" style={{ marginBottom: '12px' }}>
-                <div style={{ display: 'flex', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
-                  <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{(q.question_type || '').toUpperCase()}</span>
-                  {q.difficulty_level && <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{q.difficulty_level}</span>}
-                  {q.marks && <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{q.marks} marks</span>}
-                  {q.answer_pending && <span style={{ background: '#fff3cd', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', color: '#856404' }}>Answer Pending</span>}
-                </div>
-                <p style={{ fontWeight: '500', marginBottom: '6px' }}>Q{i + 1}. {q.question_text}</p>
-                {q.options_json && typeof q.options_json === 'object' && !q.options_json.sub_questions && (
-                  <div style={{ fontSize: '14px', color: '#555', marginTop: '4px', marginBottom: '6px' }}>
-                    {Object.entries(q.options_json).map(([k, v]) => <div key={k}><strong>{k}.</strong> {v}</div>)}
+            {paperQuestions.map((q, i) => {
+              const isCbq = q.question_type === 'cbq'
+              const subQs = isCbq && q.options_json?.sub_questions
+              return (
+                <div key={q.id} className="form-panel" style={{ marginBottom: '12px', borderLeft: isCbq ? '3px solid #4a6e6a' : undefined }}>
+                  <div style={{ display: 'flex', gap: '8px', marginBottom: '6px', flexWrap: 'wrap' }}>
+                    <span style={{ background: isCbq ? '#d4e8e4' : '#e8f0ee', color: isCbq ? '#2d4a47' : undefined, padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: isCbq ? '600' : undefined }}>{(q.question_type || '').toUpperCase()}</span>
+                    {q.difficulty_level && <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{q.difficulty_level}</span>}
+                    {q.marks && <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{q.marks} marks</span>}
+                    {q.chapter && <span style={{ background: '#f0f4f3', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', color: '#4a6e6a' }}>{q.chapter}</span>}
+                    {q.answer_pending && <span style={{ background: '#fff3cd', padding: '2px 8px', borderRadius: '4px', fontSize: '12px', color: '#856404' }}>Answer Pending</span>}
                   </div>
-                )}
-                {q.correct_answer && <p style={{ color: '#4a6e6a', fontSize: '14px' }}><strong>Answer:</strong> {q.correct_answer}</p>}
-              </div>
-            ))}
+
+                  {isCbq ? (
+                    <>
+                      <div style={{ background: '#f7faf9', border: '1px solid #d4e8e4', borderRadius: '6px', padding: '10px 14px', marginBottom: '10px', fontSize: '14px', color: '#333', lineHeight: '1.6', whiteSpace: 'pre-wrap' }}>
+                        <span style={{ fontSize: '11px', fontWeight: '600', color: '#6b8a80', display: 'block', marginBottom: '4px' }}>PASSAGE</span>
+                        {q.question_text}
+                      </div>
+                      {subQs && subQs.length > 0 && (
+                        <div>
+                          <span style={{ fontSize: '11px', fontWeight: '600', color: '#6b8a80', display: 'block', marginBottom: '6px' }}>SUB-QUESTIONS</span>
+                          {subQs.map((sq, si) => (
+                            <div key={si} style={{ display: 'flex', gap: '10px', padding: '6px 0', borderTop: si > 0 ? '1px solid #e0e8e6' : undefined, fontSize: '14px' }}>
+                              <span style={{ color: '#4a6e6a', fontWeight: '600', minWidth: '24px' }}>({sq.number})</span>
+                              <span style={{ flex: 1 }}>{sq.text}</span>
+                              {sq.marks && <span style={{ color: '#6b8a80', fontSize: '12px', whiteSpace: 'nowrap' }}>[{sq.marks}m]</span>}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <p style={{ fontWeight: '500', marginBottom: '6px' }}>Q{i + 1}. {q.question_text}</p>
+                      {q.options_json && typeof q.options_json === 'object' && (
+                        <div style={{ fontSize: '14px', color: '#555', marginTop: '4px', marginBottom: '6px' }}>
+                          {Object.entries(q.options_json).map(([k, v]) => <div key={k}><strong>{k}.</strong> {v}</div>)}
+                        </div>
+                      )}
+                    </>
+                  )}
+
+                  {q.correct_answer && <p style={{ color: '#4a6e6a', fontSize: '14px', marginTop: '6px' }}><strong>Answer:</strong> {q.correct_answer}</p>}
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
