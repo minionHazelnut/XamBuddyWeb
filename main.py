@@ -1162,31 +1162,66 @@ async def extract_chapter_title(
     subject: str = Form(""),
     exam: str = Form(""),
 ):
+    filename = file.filename
+
+    # Check chapter_meta by filename first — reuse stored title, no Claude call needed
+    if subject and exam and filename:
+        try:
+            rows = _sb_get("chapter_meta", {
+                "select": "chapter,chapter_order",
+                "file_name": f"eq.{filename}",
+                "subject": f"eq.{subject}",
+                "exam": f"eq.{exam}",
+                "limit": 1,
+            })
+            if rows:
+                r = rows[0]
+                ch_order = r.get("chapter_order")
+                return {
+                    "success": True,
+                    "chapter_title": r["chapter"],
+                    "chapter_number": ch_order if ch_order and ch_order != 999 else None,
+                    "confidence": "cached",
+                    "file_name": filename,
+                }
+        except Exception:
+            pass
+
     content = await file.read()
+    fallback_title = filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ").replace("-", " ").strip()
+
+    # Extract only the first page — the chapter title is always there
     try:
-        text = extract_text(content)
+        reader = PdfReader(io.BytesIO(content))
+        first_page = reader.pages[0].extract_text() if reader.pages else ""
+        second_page = reader.pages[1].extract_text() if len(reader.pages) > 1 else ""
+        snippet = (first_page + "\n" + second_page)[:2500]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
 
-    snippet = text[:3000]
-    ch_num_match = re.search(r'chapter\s+(\d+)', text[:1000].lower())
+    ch_num_match = re.search(r'chapter\s+(\d+)', snippet[:800].lower())
     regex_ch_num = int(ch_num_match.group(1)) if ch_num_match else None
 
-    fallback_title = file.filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ").replace("-", " ").strip()
-
     if not CLAUDE_API_KEY:
-        return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": file.filename}
+        return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": filename}
 
-    prompt = f"""This is the beginning of a CBSE textbook chapter PDF. Identify the chapter title.
+    prompt = f"""You are reading the first page of a CBSE textbook chapter in plain text (font sizes and colours are lost in extraction).
 
-The chapter title is the main prominent heading at the start of the chapter — not the book title, not a sub-heading, not a table of contents entry. It is usually the largest text near the top.
+Your task: identify the CHAPTER TITLE — the main heading of this chapter.
 
-Return ONLY this JSON (no other text):
-{{"chapter_title": "exact chapter title as written in the textbook", "chapter_number": 1}}
+How to recognise it in plain text:
+- It appears as a standalone line (or two lines) early in the text, before any body sentences begin
+- Often preceded by "Chapter N" or "Unit N" on the line above it
+- Written in title case or ALL CAPS
+- Names the topic (e.g. "Chemical Reactions and Equations", "THE LIVING WORLD", "Reproduction in Organisms")
+- NOT: the book title, publisher name, "NCERT", subject name, page numbers, table of contents entries, or sub-headings
 
-If chapter number is not visible, use null for chapter_number.
+Return ONLY this JSON, nothing else:
+{{"chapter_title": "title exactly as it appears in the text", "chapter_number": 1}}
 
-CONTENT (first part of PDF):
+Use null for chapter_number if no chapter number is visible.
+
+FIRST PAGE TEXT:
 {snippet}"""
 
     try:
@@ -1203,11 +1238,11 @@ CONTENT (first part of PDF):
             title = (parsed.get("chapter_title") or "").strip()
             ch_num = parsed.get("chapter_number") or regex_ch_num
             if title and len(title) > 3:
-                return {"success": True, "chapter_title": title, "chapter_number": ch_num, "confidence": "high", "file_name": file.filename}
+                return {"success": True, "chapter_title": title, "chapter_number": ch_num, "confidence": "high", "file_name": filename}
     except Exception as e:
-        _log_error("/api/extract-chapter-title", "claude_extract", str(e), {"file": file.filename})
+        _log_error("/api/extract-chapter-title", "claude_extract", str(e), {"file": filename})
 
-    return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": file.filename}
+    return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": filename}
 
 
 @app.get("/api/chapters")

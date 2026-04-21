@@ -347,8 +347,10 @@ export default function BulkUpload({ showStatus }) {
                     />
                   </td>
                   <td style={{ padding: '6px 8px' }}>
-                    <span style={{ padding: '2px 6px', borderRadius: '4px', fontSize: '11px', background: ch.confidence === 'high' ? '#d4edda' : '#fff3cd', color: ch.confidence === 'high' ? '#155724' : '#856404' }}>
-                      {ch.confidence}
+                    <span style={{ padding: '2px 6px', borderRadius: '4px', fontSize: '11px',
+                      background: ch.confidence === 'cached' ? '#cce5ff' : ch.confidence === 'high' ? '#d4edda' : '#fff3cd',
+                      color: ch.confidence === 'cached' ? '#004085' : ch.confidence === 'high' ? '#155724' : '#856404' }}>
+                      {ch.confidence === 'cached' ? '✓ cached' : ch.confidence}
                     </span>
                   </td>
                   <td style={{ padding: '6px 8px' }}>
