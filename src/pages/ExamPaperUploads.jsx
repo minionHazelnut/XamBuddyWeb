@@ -13,8 +13,39 @@ const sectionTitle = (text) => (
 
 const divider = <hr style={{ border: 'none', borderTop: '2px solid #e0e8e6', margin: '32px 0' }} />
 
+function detectYearFromName(name) {
+  const m = name.match(/20(\d{2})/)
+  return m ? `20${m[1]}` : ''
+}
+
+function detectTypeFromName(name) {
+  const lower = name.toLowerCase()
+  if (/sample|mock|practice|test/.test(lower)) return 'sample_paper'
+  return 'board_exam'
+}
+
+function parsePaperFolder(fileList) {
+  const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'))
+  const entries = []
+  for (const file of files) {
+    const parts = file.webkitRelativePath.split('/')
+    // Support: SubjectFolder/paper.pdf  OR  GradeFolder/SubjectFolder/paper.pdf
+    const subject = parts.length >= 3 ? parts[parts.length - 2] : parts[0]
+    entries.push({
+      file,
+      subject,
+      year: detectYearFromName(file.name),
+      paperType: detectTypeFromName(file.name),
+      edited: false,
+    })
+  }
+  // Sort: subject asc, then filename asc
+  entries.sort((a, b) => a.subject.localeCompare(b.subject) || a.file.name.localeCompare(b.file.name))
+  return entries
+}
+
 export default function ExamPaperUploads({ showStatus }) {
-  // — exam paper upload state —
+  // — single paper upload state —
   const [paperType, setPaperType] = useState('exam_paper')
   const [board, setBoard] = useState('')
   const [grade, setGrade] = useState('')
@@ -44,6 +75,14 @@ export default function ExamPaperUploads({ showStatus }) {
   const [refLoading, setRefLoading] = useState(false)
   const [refUploads, setRefUploads] = useState([])
   const [loadingRefUploads, setLoadingRefUploads] = useState(false)
+
+  // — bulk QP upload state —
+  const [bulkBoard, setBulkBoard] = useState('')
+  const [bulkGrade, setBulkGrade] = useState('')
+  const [bulkPapers, setBulkPapers] = useState([])       // parsed entries
+  const [bulkProcessing, setBulkProcessing] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState(null)  // { idx, total, subject, file }
+  const [bulkResults, setBulkResults] = useState([])      // [{subject, file, saved, skipped, error}]
 
   useEffect(() => { fetchPapers(); fetchRefUploads() }, [])
 
@@ -195,6 +234,64 @@ export default function ExamPaperUploads({ showStatus }) {
     }
   }
 
+  function handleBulkFolderChange(e) {
+    const files = e.target.files
+    if (!files || files.length === 0) { setBulkPapers([]); return }
+    setBulkPapers(parsePaperFolder(files))
+    setBulkResults([])
+    setBulkProgress(null)
+  }
+
+  function updateBulkRow(idx, field, value) {
+    setBulkPapers(prev => prev.map((r, i) => i === idx ? { ...r, [field]: value, edited: true } : r))
+  }
+
+  async function handleBulkProcess() {
+    if (!bulkBoard || !bulkGrade) { showStatus('Select board and grade first.', 'error'); return }
+    if (bulkPapers.length === 0) { showStatus('No papers found in folder.', 'error'); return }
+    setBulkProcessing(true)
+    setBulkResults([])
+    const classLevel = bulkGrade.replace(/[a-z]+$/i, '')
+    const results = []
+    let totalSaved = 0
+
+    for (let i = 0; i < bulkPapers.length; i++) {
+      const entry = bulkPapers[i]
+      setBulkProgress({ idx: i + 1, total: bulkPapers.length, subject: entry.subject, file: entry.file.name })
+      const row = { subject: entry.subject, file: entry.file.name, saved: 0, skipped: 0, extracted: 0, error: null }
+      try {
+        const formData = new FormData()
+        formData.append('file', entry.file)
+        formData.append('subject', entry.subject)
+        formData.append('class_level', classLevel)
+        formData.append('board', bulkBoard)
+        formData.append('year', entry.year || '')
+        formData.append('exam_type', entry.paperType)
+        const res = await fetch(`${API_BASE}/api/extract-paper`, { method: 'POST', body: formData })
+        const result = await res.json()
+        if (result.error) throw new Error(result.error)
+        row.extracted = result.questions_extracted || 0
+        row.saved = result.questions_saved || 0
+        row.skipped = result.duplicates_skipped || 0
+        totalSaved += row.saved
+      } catch (err) {
+        row.error = err.message
+        await fetch(`${API_BASE}/api/log`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: 'bulk-qp-upload', stage: 'extract_paper', message: `Failed: ${entry.file.name} (${entry.subject}): ${err.message}`, context: { subject: entry.subject, file: entry.file.name, board: bulkBoard, grade: bulkGrade } })
+        }).catch(() => {})
+      }
+      results.push(row)
+      setBulkResults([...results])
+    }
+
+    setBulkProcessing(false)
+    setBulkProgress(null)
+    fetchPapers()
+    showStatus(`Bulk QP processing complete. ${totalSaved} questions saved across ${bulkPapers.length} papers.`, 'success')
+  }
+
   if (selectedPaper) {
     return (
       <div className="page-content">
@@ -244,9 +341,155 @@ export default function ExamPaperUploads({ showStatus }) {
     <div className="page-content">
       <h2>Exam Paper Uploads</h2>
 
-      {/* ── Section 1: Upload exam / sample paper ── */}
+      {/* ── Section 1: Bulk QP Folder Upload ── */}
       <div className="form-panel">
-        {sectionTitle('Upload Exam / Sample Paper')}
+        {sectionTitle('Bulk Question Paper Upload (Folder)')}
+        <p style={{ color: '#6b8a80', fontSize: '14px', marginTop: '-8px', marginBottom: '16px' }}>
+          Select a folder containing subject subfolders, each with QP PDFs inside.<br />
+          Year and paper type are auto-detected from filenames — edit any row if wrong.
+        </p>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>Board *</label>
+            <select value={bulkBoard} onChange={e => setBulkBoard(e.target.value)}>
+              <option value="">Select board</option>
+              {BOARDS.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Grade *</label>
+            <select value={bulkGrade} onChange={e => setBulkGrade(e.target.value)}>
+              <option value="">Select grade</option>
+              {GRADES.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label>Select Folder *</label>
+          <label className={`file-input-label ${bulkPapers.length > 0 ? 'has-file' : ''}`}>
+            {bulkPapers.length > 0 ? `${bulkPapers.length} PDFs found` : 'Click to select folder'}
+            <input
+              type="file"
+              style={{ display: 'none' }}
+              webkitdirectory=""
+              directory=""
+              multiple
+              onChange={handleBulkFolderChange}
+            />
+          </label>
+        </div>
+
+        {bulkPapers.length > 0 && (
+          <div style={{ marginTop: '16px', overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+              <thead>
+                <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
+                  <th style={{ padding: '6px 8px' }}>File</th>
+                  <th style={{ padding: '6px 8px' }}>Subject</th>
+                  <th style={{ padding: '6px 8px' }}>Year</th>
+                  <th style={{ padding: '6px 8px' }}>Type</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bulkPapers.map((row, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #e0e8e6' }}>
+                    <td style={{ padding: '6px 8px', color: '#4a6e6a', maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.file.name}</td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <input
+                        value={row.subject}
+                        onChange={e => updateBulkRow(i, 'subject', e.target.value)}
+                        style={{ width: '120px', padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
+                      />
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <input
+                        value={row.year}
+                        onChange={e => updateBulkRow(i, 'year', e.target.value)}
+                        placeholder="e.g. 2024"
+                        style={{ width: '72px', padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
+                      />
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <select
+                        value={row.paperType}
+                        onChange={e => updateBulkRow(i, 'paperType', e.target.value)}
+                        style={{ padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
+                      >
+                        <option value="board_exam">Board Exam</option>
+                        <option value="sample_paper">Sample Paper</option>
+                      </select>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        {bulkProgress && (
+          <div style={{ marginTop: '16px', background: '#f0f4f3', borderRadius: '8px', padding: '12px 16px' }}>
+            <div style={{ fontSize: '13px', color: '#2d4a47', marginBottom: '6px' }}>
+              Processing {bulkProgress.idx}/{bulkProgress.total}: <strong>{bulkProgress.subject}</strong> — {bulkProgress.file}
+            </div>
+            <div style={{ background: '#c5d5d2', borderRadius: '4px', height: '6px' }}>
+              <div style={{ background: '#4a6e6a', height: '6px', borderRadius: '4px', width: `${(bulkProgress.idx / bulkProgress.total) * 100}%`, transition: 'width 0.3s' }} />
+            </div>
+          </div>
+        )}
+
+        {bulkPapers.length > 0 && (
+          <button
+            onClick={handleBulkProcess}
+            disabled={bulkProcessing || !bulkBoard || !bulkGrade}
+            style={{ marginTop: '16px' }}
+          >
+            {bulkProcessing ? 'Processing...' : `Extract Questions from All ${bulkPapers.length} Papers`}
+          </button>
+        )}
+
+        {bulkResults.length > 0 && (
+          <div style={{ marginTop: '20px' }}>
+            <strong style={{ fontSize: '14px' }}>Results</strong>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', marginTop: '8px' }}>
+              <thead>
+                <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
+                  <th style={{ padding: '6px 8px' }}>Subject</th>
+                  <th style={{ padding: '6px 8px' }}>File</th>
+                  <th style={{ padding: '6px 8px' }}>Extracted</th>
+                  <th style={{ padding: '6px 8px' }}>Saved</th>
+                  <th style={{ padding: '6px 8px' }}>Duplicates</th>
+                  <th style={{ padding: '6px 8px' }}>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bulkResults.map((r, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #e0e8e6' }}>
+                    <td style={{ padding: '6px 8px' }}>{r.subject}</td>
+                    <td style={{ padding: '6px 8px', color: '#4a6e6a', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.file}</td>
+                    <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.extracted}</td>
+                    <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.saved}</td>
+                    <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.skipped}</td>
+                    <td style={{ padding: '6px 8px' }}>
+                      {r.error
+                        ? <span style={{ color: '#c0392b', fontSize: '12px' }}>{r.error}</span>
+                        : <span style={{ color: '#2e7d5a', fontSize: '12px' }}>Done</span>
+                      }
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {divider}
+
+      {/* ── Section 2: Single exam / sample paper upload ── */}
+      <div className="form-panel">
+        {sectionTitle('Upload Single Exam / Sample Paper')}
         <div className="form-group">
           <label>Paper Type</label>
           <div style={{ display: 'flex', gap: '16px' }}>
@@ -304,7 +547,6 @@ export default function ExamPaperUploads({ showStatus }) {
             </label>
           </div>
 
-          {/* Checkbox — standalone row, not wrapped in form-group label */}
           <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '12px 0 16px 0', padding: '10px 14px', background: '#f0f4f3', borderRadius: '8px', cursor: 'pointer' }} onClick={() => setExtractQuestions(v => !v)}>
             <input type="checkbox" checked={extractQuestions} onChange={e => { e.stopPropagation(); setExtractQuestions(e.target.checked) }} style={{ width: '16px', height: '16px', cursor: 'pointer', accentColor: '#4a6e6a' }} />
             <span style={{ fontSize: '14px', color: '#2d4a47', fontWeight: '500' }}>Also extract questions from this paper into the question bank</span>
@@ -324,7 +566,7 @@ export default function ExamPaperUploads({ showStatus }) {
 
       {divider}
 
-      {/* ── Section 2: Extracted papers table ── */}
+      {/* ── Section 3: Extracted papers table ── */}
       <div className="form-panel">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
           {sectionTitle('Extracted Papers')}
@@ -370,7 +612,7 @@ export default function ExamPaperUploads({ showStatus }) {
 
       {divider}
 
-      {/* ── Section 3: Reference / guide book upload ── */}
+      {/* ── Section 4: Reference / guide book upload ── */}
       <div className="form-panel">
         {sectionTitle('Upload Reference Material')}
         <p style={{ color: '#6b8a80', fontSize: '14px', marginTop: '-8px', marginBottom: '16px' }}>Guide books and sample PDFs for reference only — never added to the question bank.</p>
