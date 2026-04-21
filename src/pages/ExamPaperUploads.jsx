@@ -4,7 +4,7 @@ import { supabase } from '../lib/supabase'
 const API_BASE = import.meta.env.VITE_API_URL || ''
 const BOARDS = ['CBSE', 'ICSE', 'State']
 const GRADES = ['6th', '7th', '8th', '9th', '10th', '11th', '12th']
-const SUBJECTS = ['Mathematics', 'Science', 'Physics', 'Chemistry', 'Biology', 'English', 'History', 'Geography', 'Economics', 'Political Science', 'Accountancy', 'Business Studies']
+const SUBJECTS = ['Accountancy', 'Biology', 'Business Studies', 'Chemistry', 'Economics', 'English', 'Geography', 'History', 'Mathematics', 'Physics', 'Political Science', 'Science']
 const UPLOAD_TYPES = ['guide_reference', 'sample_question', 'other']
 
 const sectionTitle = (text) => (

@@ -4,9 +4,9 @@ import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 const SUBJECTS = [
-  'Psychology', 'Mathematics', 'Physics', 'Chemistry', 'Biology',
-  'English', 'Hindi', 'History', 'Geography', 'Political Science',
-  'Economics', 'Computer Science'
+  'Biology', 'Chemistry', 'Computer Science', 'Economics', 'English',
+  'Geography', 'Hindi', 'History', 'Mathematics', 'Physics',
+  'Political Science', 'Psychology',
 ]
 
 function getChapters(exam, subject) {

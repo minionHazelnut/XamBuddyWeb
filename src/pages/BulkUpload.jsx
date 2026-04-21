@@ -137,18 +137,48 @@ export default function BulkUpload({ showStatus }) {
     if (!exam) { showStatus('Select an exam', 'error'); return }
     if (chapters.length === 0) { showStatus('Extract chapter titles first', 'error'); return }
     setProcessing(true)
+
+    // Target question counts per type (in DB, conceptual stores as 'long')
+    const DB_TYPE = { mcq: 'mcq', vsa: 'vsa', short: 'short', long: 'long', conceptual: 'long', cbq: 'cbq' }
+    const TYPE_TARGETS = { mcq: 50, vsa: 30, short: 30, long: 30, cbq: 10 }
+
+    // Fetch existing counts for this exam upfront — one call covers all chapters
+    const existingCounts = {}
+    try {
+      const statsRes = await fetch(`${API_BASE}/api/stats`)
+      const statsData = await statsRes.json()
+      for (const row of (statsData.stats || [])) {
+        if (row.exam === exam) {
+          const key = `${row.subject}||${row.chapter}||${row.question_type}`
+          existingCounts[key] = (existingCounts[key] || 0) + row.count
+        }
+      }
+    } catch {}
+
     const allResults = []
     let grandTotal = 0
 
     for (let ci = 0; ci < chapters.length; ci++) {
       const ch = chapters[ci]
-      setProgress({ chapterIdx: ci + 1, total: chapters.length, subject: ch.subject, title: ch.title, batch: 0, totalBatches: BATCHES.length, batchLabel: 'Starting...', savedTotal: grandTotal })
+      setProgress({ chapterIdx: ci + 1, total: chapters.length, subject: ch.subject, title: ch.title, batch: 0, totalBatches: BATCHES.length, batchLabel: 'Checking...', savedTotal: grandTotal })
 
-      const chResult = { subject: ch.subject, title: ch.title, saved: 0, errors: [] }
+      const chResult = { subject: ch.subject, title: ch.title, saved: 0, skipped: 0, errors: [] }
       let fatalMismatch = false
+      let firstBatchRun = true
 
       for (let bi = 0; bi < BATCHES.length; bi++) {
         const batch = BATCHES[bi]
+        const dbType = DB_TYPE[batch.q_type]
+        const target = TYPE_TARGETS[dbType] || batch.num_q
+        const typeKey = `${ch.subject}||${ch.title}||${dbType}`
+        const alreadyHave = existingCounts[typeKey] || 0
+
+        if (alreadyHave >= target) {
+          chResult.skipped++
+          continue
+        }
+
+        const adjustedNumQ = Math.min(batch.num_q, target - alreadyHave)
         setProgress(p => ({ ...p, batch: bi + 1, batchLabel: batch.label }))
 
         const formData = new FormData()
@@ -158,16 +188,17 @@ export default function BulkUpload({ showStatus }) {
         formData.append('chapter', ch.title)
         formData.append('q_type', batch.q_type)
         formData.append('difficulty', 'mixed')
-        formData.append('num_q', batch.num_q)
+        formData.append('num_q', adjustedNumQ)
         if (ch.chapterNumber != null) formData.append('chapter_order', ch.chapterNumber)
 
         try {
           let res
-          if (bi === 0) {
+          if (firstBatchRun) {
             ;[res] = await Promise.all([
               fetch(`${API_BASE}/api/generate`, { method: 'POST', body: formData }),
               uploadChapterPdf(ch.file, ch.subject, ch.title),
             ])
+            firstBatchRun = false
           } else {
             res = await fetch(`${API_BASE}/api/generate`, { method: 'POST', body: formData })
           }
@@ -176,17 +207,18 @@ export default function BulkUpload({ showStatus }) {
           if (result.questions) {
             chResult.saved += result.questions.length
             grandTotal += result.questions.length
+            existingCounts[typeKey] = alreadyHave + result.questions.length
           } else if (result.error) {
             chResult.errors.push(`${batch.label}: ${result.error}`)
             fetch(`${API_BASE}/api/log`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Failed to generate ${batch.q_type} for "${ch.title}" (${ch.subject}): ${result.error}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type, num_q_requested: batch.num_q, num_q_generated: 0 } })
+              body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Failed to generate ${batch.q_type} for "${ch.title}" (${ch.subject}): ${result.error}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type, num_q_requested: adjustedNumQ, num_q_generated: 0 } })
             }).catch(() => {})
             if (res.status === 422) {
               fatalMismatch = true
               fetch(`${API_BASE}/api/log`, {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ endpoint: 'bulk-upload', stage: 'chapter_mismatch', message: `Chapter title mismatch: "${ch.title}" (${ch.subject}) — all remaining batches skipped`, context: { subject: ch.subject, chapter: ch.title, exam, batches_completed: bi, batches_skipped: BATCHES.length - bi - 1, generated_so_far: chResult.saved } })
+                body: JSON.stringify({ endpoint: 'bulk-upload', stage: 'chapter_mismatch', message: `Chapter title mismatch: "${ch.title}" (${ch.subject}) — remaining batches skipped`, context: { subject: ch.subject, chapter: ch.title, exam, batches_completed: bi, batches_skipped: BATCHES.length - bi - 1, generated_so_far: chResult.saved } })
               }).catch(() => {})
               showStatus(`Mismatch detected for "${ch.title}" — check Error Log`, 'error')
               break
@@ -196,7 +228,7 @@ export default function BulkUpload({ showStatus }) {
           chResult.errors.push(`${batch.label}: ${err.message}`)
           fetch(`${API_BASE}/api/log`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Network/server error for "${ch.title}" (${ch.subject}), batch ${batch.label}: ${err.message}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type } })
+            body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Network error for "${ch.title}" (${ch.subject}), ${batch.label}: ${err.message}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type } })
           }).catch(() => {})
         }
       }
@@ -362,7 +394,8 @@ export default function BulkUpload({ showStatus }) {
               <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
                 <th style={{ padding: '6px 8px' }}>Subject</th>
                 <th style={{ padding: '6px 8px' }}>Chapter</th>
-                <th style={{ padding: '6px 8px' }}>Questions Saved</th>
+                <th style={{ padding: '6px 8px' }}>New Questions</th>
+                <th style={{ padding: '6px 8px' }}>Batches Skipped</th>
                 <th style={{ padding: '6px 8px' }}>Issues</th>
               </tr>
             </thead>
@@ -372,6 +405,9 @@ export default function BulkUpload({ showStatus }) {
                   <td style={{ padding: '6px 8px' }}>{r.subject}</td>
                   <td style={{ padding: '6px 8px' }}>{r.title}</td>
                   <td style={{ padding: '6px 8px', fontWeight: '600', color: '#4a6e6a' }}>{r.saved}</td>
+                  <td style={{ padding: '6px 8px', color: r.skipped === BATCHES.length ? '#155724' : '#6b8a80' }}>
+                    {r.skipped}/{BATCHES.length} {r.skipped === BATCHES.length ? '✓ already complete' : ''}
+                  </td>
                   <td style={{ padding: '6px 8px', fontSize: '12px', color: r.errors.length > 0 ? '#c0392b' : '#6b8a80' }}>
                     {r.mismatch ? 'Chapter mismatch — skipped (see Error Log)' : r.errors.length > 0 ? r.errors.join(' | ') : '—'}
                   </td>
