@@ -6,6 +6,9 @@ import GenerateQuestions from './GenerateQuestions'
 import RetrieveQuestions from './RetrieveQuestions'
 import ExamPaperUploads from './ExamPaperUploads'
 import ExamPaperRetrieve from './ExamPaperRetrieve'
+import RetrieveChapterPdfs from './RetrieveChapterPdfs'
+import QuestionPaperBank from './QuestionPaperBank'
+import ReferenceUploads from './ReferenceUploads'
 
 export default function AdminDashboard() {
   const navigate = useNavigate()
@@ -35,6 +38,9 @@ export default function AdminDashboard() {
     { id: 'retrieve', label: 'Retrieve Questions', icon: '\u2B07' },
     { id: 'exam-uploads', label: 'Exam Paper Uploads', icon: '\u{1F4C4}' },
     { id: 'exam-retrieve', label: 'Exam Paper Retrieve', icon: '\u{1F50D}' },
+    { id: 'chapter-retrieve', label: 'Retrieve Chapter PDFs', icon: '\u{1F4DA}' },
+    { id: 'paper-bank', label: 'Question Paper Bank', icon: '\u{1F4DD}' },
+    { id: 'reference-uploads', label: 'Reference Uploads', icon: '\u{1F4D6}' },
   ]
 
   return (
@@ -79,6 +85,9 @@ export default function AdminDashboard() {
         {activeTab === 'retrieve' && <RetrieveQuestions showStatus={showStatus} />}
         {activeTab === 'exam-uploads' && <ExamPaperUploads showStatus={showStatus} />}
         {activeTab === 'exam-retrieve' && <ExamPaperRetrieve showStatus={showStatus} />}
+        {activeTab === 'chapter-retrieve' && <RetrieveChapterPdfs showStatus={showStatus} />}
+        {activeTab === 'paper-bank' && <QuestionPaperBank showStatus={showStatus} />}
+        {activeTab === 'reference-uploads' && <ReferenceUploads showStatus={showStatus} />}
       </main>
     </div>
   )

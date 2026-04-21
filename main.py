@@ -8,6 +8,7 @@ import random
 import logging
 import urllib.request
 import urllib.parse
+import uuid
 from datetime import datetime
 from pypdf import PdfReader
 import io
@@ -53,6 +54,19 @@ def _sb_post(table, data):
     with urllib.request.urlopen(req, timeout=15) as resp:
         resp.read()
 
+# ---------- Error logging ----------
+
+def _log_error(endpoint: str, stage: str, error: str, context: dict = None):
+    try:
+        _sb_post("processing_errors", [{
+            "endpoint": endpoint,
+            "stage": stage,
+            "error_message": error,
+            "context_json": context or {},
+        }])
+    except Exception:
+        pass
+
 # ---------- Question helpers ----------
 
 def _difficulty_for_db(difficulty: str) -> str:
@@ -68,6 +82,17 @@ def _question_type_for_db(q_type: str, item: dict) -> str:
 def _exact_question_fingerprint(text: str) -> str:
     s = (text or "").strip().lower()
     return re.sub(r"\s+", " ", s)
+
+def _jaccard(a: str, b: str) -> float:
+    sa, sb = set(a.split()), set(b.split())
+    union = sa | sb
+    return len(sa & sb) / len(union) if union else 0.0
+
+def _too_similar_to_existing(norm: str, existing: set, threshold: float = 0.8) -> bool:
+    for ex in existing:
+        if _jaccard(norm, ex) >= threshold:
+            return True
+    return False
 
 def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
     # CBQ items are structured differently
@@ -93,10 +118,6 @@ def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
         ans = (q.get("answer") or "").strip()
         if len(ans) < 20:
             return False
-    if not qt.endswith("?"):
-        qt_stripped = qt.rstrip(".!:;")
-        if not qt_stripped.endswith("?") and not any(qt.lower().startswith(w) for w in ("explain", "describe", "discuss", "analyse", "analyze", "compare", "evaluate", "differentiate", "why", "how", "what")):
-            pass
     return True
 
 def _get_existing_fingerprints(exam, subject, chapter_db):
@@ -116,7 +137,62 @@ def _get_existing_fingerprints(exam, subject, chapter_db):
     except Exception:
         return set()
 
-def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
+def _get_existing_exam_question_fingerprints(subject, class_level, board):
+    params = {
+        "select": "question_text",
+        "subject": f"eq.{subject}",
+        "class_level": f"eq.{class_level}",
+        "board": f"eq.{board}",
+        "limit": 2000,
+    }
+    try:
+        rows = _sb_get("exam_questions", params)
+        return {_exact_question_fingerprint(r["question_text"]) for r in rows}
+    except Exception:
+        return set()
+
+def _save_exam_questions(questions, subject, class_level, board, year, exam_type, source_paper_id):
+    existing = _get_existing_exam_question_fingerprints(subject, class_level, board)
+    type_map = {"MCQ": "mcq", "VSA": "vsa", "SA": "sa", "LA": "la", "CBQ": "cbq"}
+    to_insert = []
+    skipped = 0
+    for q in questions:
+        qtext = (q.get("question_text") or "").strip()
+        if not qtext or len(qtext) < 5:
+            continue
+        norm = _exact_question_fingerprint(qtext)
+        if norm in existing:
+            skipped += 1
+            continue
+        q_type_raw = (q.get("question_type") or "").upper()
+        marks = q.get("marks")
+        try:
+            marks = int(marks) if marks is not None else None
+        except (ValueError, TypeError):
+            marks = None
+        row = {
+            "question_text": qtext,
+            "question_type": type_map.get(q_type_raw, q_type_raw.lower()) or None,
+            "marks": marks,
+            "subject": subject,
+            "class_level": class_level,
+            "board": board,
+            "year": year,
+            "exam_type": exam_type,
+            "chapter": q.get("chapter") or None,
+            "correct_answer": None,
+            "options_json": q.get("options") or None,
+            "difficulty_level": (q.get("difficulty_level") or "").lower() or None,
+            "answer_pending": True,
+            "source_paper_id": source_paper_id,
+        }
+        to_insert.append(row)
+        existing.add(norm)
+    if to_insert:
+        _sb_post("exam_questions", to_insert)
+    return len(to_insert), skipped
+
+def save_questions(questions, q_type, difficulty, subject, exam, chapter="", source_chapter_id=None):
     diff_db = _difficulty_for_db(difficulty)
     chapter_db = chapter.strip() or None
     existing = _get_existing_fingerprints(exam, subject, chapter_db)
@@ -130,7 +206,7 @@ def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
                 continue
             passage = (q.get("passage") or "").strip()
             norm = _exact_question_fingerprint(passage)
-            if not norm or norm in existing:
+            if not norm or norm in existing or _too_similar_to_existing(norm, existing):
                 continue
             row = {
                 "exam": exam,
@@ -142,6 +218,9 @@ def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
                 "correct_answer": None,
                 "explanation": None,
                 "options": {"sub_questions": q.get("sub_questions", [])},
+                "keywords_json": q.get("keywords") or [],
+                "is_practical": bool(q.get("is_practical", False)),
+                "source_chapter_id": source_chapter_id,
             }
             to_insert.append(row)
             existing.add(norm)
@@ -151,7 +230,7 @@ def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
         if not _ai_item_is_clean_for_db(q, row_type):
             continue
         norm = _exact_question_fingerprint(qtext_raw)
-        if not norm or norm in existing:
+        if not norm or norm in existing or _too_similar_to_existing(norm, existing):
             continue
         row = {
             "exam": exam,
@@ -162,6 +241,9 @@ def save_questions(questions, q_type, difficulty, subject, exam, chapter=""):
             "difficulty": diff_db,
             "correct_answer": str(q["answer"]) if q.get("answer") is not None else None,
             "explanation": str(q["explanation"]) if q.get("explanation") else None,
+            "keywords_json": q.get("keywords") or [],
+            "is_practical": bool(q.get("is_practical", False)),
+            "source_chapter_id": source_chapter_id,
         }
         if row_type == "mcq" and q.get("options") is not None:
             row["options"] = q["options"]
@@ -221,120 +303,200 @@ def extract_text(file_bytes):
 def truncate_text(text, max_chars=18000):
     return text[:max_chars] if len(text) > max_chars else text
 
+# ---------- Chapter analysis ----------
+
+SUBJECT_DEFAULTS = {
+    "mathematics": (90, 10), "math": (90, 10), "maths": (90, 10),
+    "physics": (60, 40),
+    "chemistry": (50, 50),
+    "biology": (15, 85),
+    "accountancy": (85, 15),
+    "business studies": (20, 80),
+    "history": (10, 90),
+    "political science": (10, 90),
+    "geography": (10, 90),
+    "sociology": (10, 90),
+    "english": (10, 90),
+}
+
+def _subject_defaults(subject):
+    return SUBJECT_DEFAULTS.get((subject or "").lower().strip(), (50, 50))
+
+def _analyse_chapter(text, subject):
+    default_practical, default_theory = _subject_defaults(subject)
+    snippet = text[:6000]
+    prompt = f"""Analyse this CBSE chapter content and determine the practical vs theory content ratio.
+
+SUBJECT: {subject}
+SUBJECT DEFAULT: {default_practical}% practical, {default_theory}% theory — override only if the content clearly differs.
+
+Practical content: numerical problems, calculations, graphs, data interpretation, applied problem solving, worked examples.
+Theory content: explanatory prose, definitions, conceptual descriptions, historical or factual text.
+
+Also list every major heading and sub-heading you can identify in the chapter.
+
+Return ONLY this JSON object, no other text:
+{{"practical_pct": {default_practical}, "theory_pct": {default_theory}, "headings": ["heading1", "heading2"]}}
+
+CHAPTER CONTENT:
+{snippet}"""
+    try:
+        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        response = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        start, end = raw.find("{"), raw.rfind("}") + 1
+        if start != -1 and end > start:
+            parsed = json.loads(raw[start:end])
+            practical = int(parsed.get("practical_pct", default_practical))
+            theory = int(parsed.get("theory_pct", default_theory))
+            headings = parsed.get("headings") or []
+            total = practical + theory
+            if total != 100 and total > 0:
+                practical = round(practical * 100 / total)
+                theory = 100 - practical
+            return practical, theory, headings
+    except Exception:
+        pass
+    return default_practical, default_theory, []
+
+def _run_coverage_check(headings, subject, exam, chapter, chapter_id, full_text):
+    if not headings:
+        return []
+    try:
+        rows = _sb_get("questions", {
+            "select": "question_text",
+            "subject": f"eq.{subject}",
+            "exam": f"eq.{exam}",
+            "chapter": f"eq.{chapter}",
+            "limit": 1000,
+        })
+        all_text = " ".join((r.get("question_text") or "").lower() for r in rows)
+    except Exception:
+        return []
+
+    uncovered = []
+    for heading in headings:
+        if heading.lower()[:30] not in all_text:
+            uncovered.append(heading)
+
+    if not uncovered:
+        return []
+
+    topup_prompt = f"""You are a CBSE question setter. The following chapter headings have no questions yet. Generate exactly 1 Short Answer (SA) question and 1 MCQ for EACH heading listed below.
+
+SUBJECT: {subject}
+CHAPTER: {chapter}
+
+HEADINGS WITH NO COVERAGE:
+{chr(10).join(f"- {h}" for h in uncovered)}
+
+SA rules: begin with Explain/Describe/Why/How. Answer 40-70 words. Include keywords array (min 3). Set is_practical based on content.
+MCQ rules: 4 options A B C D, answer is one letter. Include keywords array (min 3).
+
+OUTPUT FORMAT (return ONLY a valid JSON array):
+[{{"question_type":"short","question":"...","answer":"...","explanation":"...","keywords":["k1","k2","k3"],"is_practical":false}},{{"question_type":"mcq","question":"...","options":{{"A":"...","B":"...","C":"...","D":"..."}},"answer":"A","explanation":"...","keywords":["k1","k2","k3"],"is_practical":false}}]
+
+CHAPTER CONTENT (excerpt):
+{full_text[:8000]}"""
+
+    try:
+        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        response = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": topup_prompt}],
+        )
+        raw = response.content[0].text
+        topup_data, err = _parse_ai_questions_json(raw, getattr(response, "stop_reason", None))
+        if topup_data and not err:
+            save_questions(topup_data, "mixed", "mixed", subject, exam, chapter, source_chapter_id=chapter_id)
+            return uncovered
+    except Exception:
+        pass
+    return uncovered
+
+def _get_or_store_chapter_meta(subject, exam, chapter, text):
+    try:
+        rows = _sb_get("chapter_meta", {
+            "select": "id,practical_pct,theory_pct,headings",
+            "subject": f"eq.{subject}",
+            "exam": f"eq.{exam}",
+            "chapter": f"eq.{chapter}",
+            "limit": 1,
+        })
+        if rows:
+            r = rows[0]
+            return r["id"], r["practical_pct"], r["theory_pct"], r.get("headings") or []
+    except Exception:
+        pass
+    practical_pct, theory_pct, headings = _analyse_chapter(text, subject)
+    chapter_id = str(uuid.uuid4())
+    try:
+        _sb_post("chapter_meta", [{"id": chapter_id, "subject": subject, "exam": exam,
+                                    "chapter": chapter, "practical_pct": practical_pct,
+                                    "theory_pct": theory_pct, "headings": headings}])
+    except Exception:
+        pass
+    return chapter_id, practical_pct, theory_pct, headings
+
 # ---------- Claude prompt config ----------
 
 FORMAT_EXAMPLES = {
-    "mcq": '[{"question":"Which of the following best describes X?","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"B","explanation":"Key terms: ...; This scores full marks because ..."}]',
-    "short": '[{"question":"Explain why X occurs.","answer":"[Context sentence.] [Core explanation in 1-2 sentences with all key terms.] [Implication or example sentence.]","explanation":"Keywords that earn marks: X, Y, Z"}]',
-    "long": '[{"question":"Analyse the significance of X in detail.","answer":"[Introduction sentence setting context.] [Core explanation covering all marking scheme sub-points, with all key terms.] [Diagram note if relevant: (include diagram of X here).] [Concluding sentence stating significance.]","explanation":"Marking scheme points: 1. ... 2. ... 3. ..."}]',
-    "conceptual": '[{"question":"How does X relate to Y?","answer":"[Introduction.] [Core explanation.] [Conclusion.]","explanation":"Marking scheme points: 1. ... 2. ..."}]',
-    "mixed": '[{"question_type":"mcq","question":"Which of the following is correct about X?","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"Key terms: ..."},{"question_type":"short","question":"Explain how X affects Y.","answer":"[Context.] [Explanation.] [Example.]","explanation":"Keywords: X, Y, Z"}]',
-    "cbq": '[{"question_type":"cbq","passage":"[60-100 word real-world/current-affairs scenario derived from chapter content, NO direct copy from PDF]","sub_questions":[{"question":"What is X? [easy]","difficulty":"easy","answer":"[Direct recall answer, max 100 words]"},{"question":"Why does X happen? [medium]","difficulty":"medium","answer":"[Understanding-level answer, max 100 words]"},{"question":"Analyse how X impacts Y. [hard]","difficulty":"hard","answer":"[Analytical answer, max 100 words]"}]}]',
+    "mcq": '[{"question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
+    "short": '[{"question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
+    "long": '[{"question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3","keyword4","keyword5","keyword6"],"is_practical":false}]',
+    "conceptual": '[{"question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3","keyword4","keyword5","keyword6"],"is_practical":false}]',
+    "mixed": '[{"question_type":"mcq","question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false},{"question_type":"short","question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
+    "cbq": '[{"question_type":"cbq","passage":"60-100 word real-world/scenario passage","sub_questions":[{"question":"string","difficulty":"easy","answer":"string"},{"question":"string","difficulty":"medium","answer":"string"},{"question":"string","difficulty":"hard","answer":"string"}],"keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
 }
-
-# Subject-level practical/theory defaults (Section B, Step 1)
-SUBJECT_PRACTICAL_PCT = {
-    "Mathematics": 92, "Physics": 60, "Chemistry": 50, "Biology": 15,
-    "Accountancy": 85, "Business Studies": 20,
-    "History": 10, "Political Science": 10, "Geography": 15,
-    "Sociology": 10, "English": 10, "Hindi": 10,
-    "Economics": 30,
-}
-
-def _practical_theory_instruction(subject: str) -> str:
-    pct = SUBJECT_PRACTICAL_PCT.get(subject, None)
-    if pct is None:
-        return "Determine the practical vs theory split entirely from the chapter content. Practical questions involve calculations, data interpretation, numerical problems, graphs, or applied problem-solving. Theory questions involve explanations, definitions, concepts, and reasoning."
-    theory_pct = 100 - pct
-    return f"For {subject}: generate approximately {pct}% practical questions (calculations, numerical problems, applied problem-solving, data interpretation) and {theory_pct}% theory questions (definitions, explanations, concepts, reasoning). Override this ratio only if the chapter content clearly has a different balance."
 
 TYPE_RULES = {
-    "mcq": """MCQ GENERATION RULES — follow every rule strictly:
+    "mcq": """MCQ rules (follow strictly):
+- Easy MCQs: surface-level factual, direct recall, one-line definitions, who/what/which questions. Distractors plausible but clearly wrong to a student who has studied.
+- Medium MCQs: require understanding and application. Student must think, not just recall. Apply concept to a scenario, identify the correct process, choose between similar-sounding concepts.
+- Hard MCQs: conceptual depth. Why does X happen, which best explains, how does X relate to Y. Distractors must be very close to the correct answer and require genuine understanding to differentiate.
+- Generate 4 options labelled A, B, C, D for every MCQ.
+- Distribute correct answers equally across A, B, C, D — no single option should be correct more than 30% of the time across the set.
+- answer field must be a single letter: A, B, C, or D.
+- Return ONLY a valid JSON array.""",
 
-EASY MCQs — surface-level factual recall:
-  - Test direct recall: one-line definitions, "who discovered", "what is the formula for", "which of the following is correct about X"
-  - Correct answer must be unambiguous
-  - Distractors must be plausible but clearly wrong to any student who has studied the chapter
+    "short": """Short Answer (SA) rules (follow strictly):
+- Every question must begin with: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when, or a similar prompt that demands explanation.
+- NO one-word or one-line answer questions allowed.
+- Answer format (40–70 words, complete sentences): one sentence of context → one to two sentences of core explanation → one sentence of implication or example if applicable.
+- Include all key terms a CBSE examiner would look for in the answer.
+- explanation field: note what keywords/concepts make this answer score full marks.
+- Return ONLY a valid JSON array.""",
 
-MEDIUM MCQs — understanding and application:
-  - Student must think, not just recall
-  - Types: apply a concept to a scenario, identify the correct process, choose between two similar-sounding concepts
-  - No trivially easy or trivially hard questions at this level
+    "long": """Long Answer (LA) rules (follow strictly):
+- Questions must use: why, how, explain in detail, analyse, discuss, compare, evaluate.
+- Answer structure (max 120 words, complete paragraphs): proper introduction sentence setting context → core explanation covering every sub-point a CBSE marking scheme awards marks for → concluding sentence summarising or stating significance.
+- All keywords an examiner would look for must appear throughout introduction, body, and conclusion.
+- Note "[include diagram of X here]" in the answer where a diagram is relevant.
+- explanation field: list the key points that would earn marks in a CBSE marking scheme.
+- Return ONLY a valid JSON array.""",
 
-HARD MCQs — conceptual depth:
-  - Use: "why does X happen", "which of the following best explains", "how does X relate to Y", "what would happen if"
-  - Distractors must be very close to the correct answer — genuine understanding required to differentiate
+    "conceptual": """Conceptual/Long Answer rules (follow strictly):
+- Same rules as Long Answer above.
+- Focus on why/how/analyse/evaluate/discuss prompts requiring deep understanding.
+- Max 120 words per answer. Structured paragraph format.
+- Return ONLY a valid JSON array.""",
 
-ALL MCQs:
-  - Exactly 4 options labelled A, B, C, D — no more, no less
-  - Distribute correct answers across A, B, C, D — no single option correct more than 30% of the time across the full set — randomise this
-  - "answer" field must be a single uppercase letter: A, B, C, or D
-  - "explanation" field: state which key terms/concepts make this the correct answer and why each distractor is wrong""",
+    "mixed": """Mixed (MCQ + Short Answer) rules:
+- Each item must have a question_type field set to either "mcq" or "short".
+- Follow MCQ rules exactly for mcq items.
+- Follow Short Answer rules exactly for short items.
+- Return ONLY a valid JSON array.""",
 
-    "short": """SHORT ANSWER (SA) GENERATION RULES — follow every rule strictly:
-
-QUESTION RULES:
-  - Every question MUST begin with one of: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when — or equivalent explanation-demanding prompt
-  - FORBIDDEN: questions with a one-word or one-line answer
-  - Include a mix of easy (recall-based), medium (application), and hard (analytical) questions
-
-ANSWER RULES — strictly 40 to 70 words per answer:
-  - Written in complete sentences only
-  - Structure: (1) one sentence of context setting the topic → (2) one to two sentences of core explanation containing ALL key terms a CBSE examiner looks for → (3) one sentence of implication, significance, or example
-  - Every answer must contain at least 3 domain-relevant keywords
-  - Answers must be written so a student who memorises them scores full marks in CBSE exams
-
-"explanation" field: list the specific keywords and sub-points that earn marks in a CBSE marking scheme""",
-
-    "long": """LONG ANSWER (LA) GENERATION RULES — follow every rule strictly:
-
-QUESTION RULES:
-  - Questions MUST use: why, how, explain in detail, analyse, discuss, compare, evaluate
-  - Questions must demand paragraph-level thinking and deep understanding
-
-ANSWER RULES — strictly max 120 words, structured paragraph format:
-  - STRUCTURE (mandatory):
-      → Introduction: one proper sentence setting context for the answer
-      → Body: core explanation covering ALL sub-points a CBSE marking scheme would award marks for; include every keyword an examiner looks for
-      → Conclusion: one sentence summarising or stating the significance
-  - If a diagram or table is relevant, note it as: (include diagram of X here)
-  - Every answer must contain at least 6 domain-relevant keywords
-  - Answers must be written so a student who memorises them scores full marks in CBSE exams
-
-"explanation" field: list all marking scheme points (e.g. "1. definition of X — 1 mark; 2. process of Y — 2 marks")""",
-
-    "conceptual": """CONCEPTUAL / LONG ANSWER GENERATION RULES — same as Long Answer, follow every rule:
-
-QUESTION RULES:
-  - Use: why, how, analyse, evaluate, discuss — demand deep conceptual understanding
-  - No surface-level or recall-based questions
-
-ANSWER RULES — max 120 words, structured paragraphs:
-  - Introduction → Body (all key sub-points + keywords) → Conclusion
-  - Minimum 6 domain-relevant keywords
-  - Note diagrams where relevant: (include diagram of X here)
-
-"explanation" field: list marking scheme points""",
-
-    "mixed": """MIXED (MCQ + SHORT ANSWER) GENERATION RULES:
-  - Each item MUST have "question_type" set to either "mcq" or "short"
-  - Roughly half MCQ, half short answer
-  - Apply ALL MCQ rules exactly for question_type="mcq" items
-  - Apply ALL Short Answer rules exactly for question_type="short" items""",
-
-    "cbq": """CASE-BASED QUESTION (CBQ) GENERATION RULES — follow every rule strictly:
-
-PASSAGE RULES:
-  - 60 to 100 words exactly
-  - Must be based on a real-world application, current affairs hook, or scenario DERIVED from the chapter content
-  - Must NOT directly copy text from the PDF — reframe in new words as a scenario
-
-SUB-QUESTION RULES — exactly 3 sub-questions per CBQ:
-  - Sub-question 1 (easy): direct recall from the passage
-  - Sub-question 2 (medium): requires understanding and application
-  - Sub-question 3 (hard): requires analysis, evaluation, or application beyond the passage
-  - Each sub-question answer: max 100 words, complete sentences, all relevant keywords present
-  - Total CBQ carries 4 marks""",
+    "cbq": """Case-Based Question (CBQ) rules (follow strictly):
+- Each CBQ must have: a passage of 60–100 words based on a real-world application, current affairs hook, or scenario derived from the chapter content.
+- 3 sub-questions progressing in difficulty: first easy (direct recall from passage), second medium (requires understanding), third hard (requires analysis or application beyond the passage).
+- Each sub-question answer must not exceed 100 words.
+- Return ONLY a valid JSON array.""",
 }
 
 MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192, "cbq": 8192}
@@ -479,7 +641,14 @@ async def generate_from_pdf(
     if not text.strip():
         raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
-    full_text = truncate_text(text)
+    full_text = truncate_text(text, 80000)
+
+    # Step 1: analyse chapter — get practical/theory split and headings
+    chapter_id, practical_pct, theory_pct, headings = _get_or_store_chapter_meta(subject, exam, chapter, full_text)
+
+    practical_count = round(num_q * practical_pct / 100)
+    theory_count = num_q - practical_count
+
     existing_questions = []
     try:
         existing = get_cached_questions(q_type, difficulty, subject, exam, chapter, 500)
@@ -488,78 +657,40 @@ async def generate_from_pdf(
         pass
 
     difficulty_map = {
-        "easy":   "EASY — test surface-level factual recall and direct definitions only",
-        "medium": "MEDIUM — test understanding and application; student must think, not just recall",
-        "hard":   "HARD — test deep reasoning, conceptual analysis, multi-step thinking",
-        "mixed":  "MIXED — distribute questions equally across easy, medium, and hard difficulty levels",
+        "easy": "Easy — surface-level factual, direct recall, definitions",
+        "medium": "Medium — understanding and application, requires thinking not just recall",
+        "hard": "Hard — deep reasoning, analytical, conceptual, multi-step",
+        "mixed": "Mixed — distribute equally across easy, medium, and hard",
     }
 
-    practical_theory_rule = _practical_theory_instruction(subject)
+    prompt = f"""You are an expert CBSE question paper setter generating questions for Class 10/12 students.
 
-    prompt = f"""You are a senior CBSE question paper setter with 20 years of experience writing board exam papers for Class 10 and Class 12 students in India. You set questions for the subject {subject}.
+SUBJECT: {subject}
+CHAPTER: {chapter}
+EXAM: {exam}
+QUESTION TYPE: {q_type}
+DIFFICULTY: {difficulty_map.get(difficulty, difficulty)}
+NUMBER OF QUESTIONS TO GENERATE: {num_q}
 
-═══════════════════════════════════════════════
-TASK PARAMETERS
-═══════════════════════════════════════════════
-Subject      : {subject}
-Chapter      : {chapter}
-Exam         : {exam}
-Question Type: {q_type.upper()}
-Difficulty   : {difficulty_map.get(difficulty, difficulty)}
-Count        : Generate exactly {num_q} question(s)
+PRACTICAL vs THEORY SPLIT: This chapter is {practical_pct}% practical and {theory_pct}% theory. Of the {num_q} questions, generate approximately {practical_count} as numerical/applied/practical questions and {theory_count} as conceptual/theoretical questions. Set is_practical to true for practical questions and false for theory questions.
 
-═══════════════════════════════════════════════
-STEP 1 — CHAPTER ANALYSIS (do this mentally before generating)
-═══════════════════════════════════════════════
-Before generating any question:
-1. Read the entire CHAPTER CONTENT below thoroughly.
-2. Identify all major headings, sub-headings, key concepts, definitions, formulas, examples, and case studies.
-3. Determine the practical vs theory split of this chapter.
-   {practical_theory_rule}
-4. Divide the chapter into logical segments. You must generate questions proportionally from EVERY segment — do NOT cluster questions around the introduction or any single section. Every major heading must be represented by at least one question in the final output.
-
-═══════════════════════════════════════════════
-STEP 2 — QUESTION TYPE RULES
-═══════════════════════════════════════════════
+RULES FOR THIS QUESTION TYPE:
 {TYPE_RULES.get(q_type, '')}
 
-═══════════════════════════════════════════════
-STEP 3 — UNIVERSAL QUALITY STANDARDS (Section D)
-═══════════════════════════════════════════════
-Every single question and answer you generate MUST pass ALL of the following checks:
+COVERAGE RULE: Generate questions proportionally from across the ENTIRE chapter content below. Do NOT concentrate questions on the introduction or any single section. Identify all major topics/headings in the content and ensure each is represented.
 
-QUESTION CHECKS:
-✓ Question text must end with a question mark OR be a clear instruction (Explain..., Analyse..., Describe...)
-✓ Question must be fully self-contained — do NOT reference "the figure above", "Table 2", "as shown", "Example 3", or any page/section numbers from the PDF
-✓ Question must be derivable from and answerable using the chapter content provided
+ANSWER QUALITY RULE: Every answer must include all important keywords that CBSE examiners look for. Answers must be written in complete sentences such that a student who memorises them will score full marks in any school, board, or competitive exam on this topic.
 
-ANSWER CHECKS:
-✓ Answer must NOT be empty
-✓ For SA and LA: answer must NOT be a single word or single sentence — full structured answer required
-✓ SA answers: minimum 3 domain-relevant keywords from the chapter
-✓ LA/Conceptual answers: minimum 6 domain-relevant keywords from the chapter
-✓ All answers must be written in complete sentences
-✓ Answers must be written such that a student who memorises them will score FULL MARKS in any CBSE school exam, board exam, or competitive exam on this topic
+SELF-CONTAINED RULE: Do NOT reference figures, tables, examples by number, or page numbers from the PDF. Every question and answer must be fully self-contained.
 
-MCQ-SPECIFIC CHECKS:
-✓ Exactly 4 options labelled A, B, C, D — no more, no less
-✓ Exactly one correct answer stored in the "answer" field as a single uppercase letter
-✓ Correct answers distributed across A, B, C, D — no option correct more than 30% of the time
-
-═══════════════════════════════════════════════
-OUTPUT FORMAT
-═══════════════════════════════════════════════
-Return ONLY a valid JSON array. No preamble, no explanation, no markdown, no code fences. Just the raw JSON array.
-Example format:
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
 {FORMAT_EXAMPLES.get(q_type, '')}
 
-═══════════════════════════════════════════════
-CHAPTER CONTENT
-═══════════════════════════════════════════════
+CHAPTER CONTENT:
 {full_text}"""
 
     if existing_questions:
-        prompt += "\n\n═══════════════════════════════════════════════\nDO NOT REPEAT — existing questions for this chapter (skip any question with >80% similarity to these):\n═══════════════════════════════════════════════\n" + "\n".join(f"- {q}" for q in existing_questions)
+        prompt += "\n\nDO NOT repeat or closely paraphrase any of these existing questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
 
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
@@ -575,11 +706,300 @@ CHAPTER CONTENT
         return {"error": parse_err, "raw": raw}
 
     try:
-        save_questions(data, q_type, difficulty, subject, exam, chapter)
+        save_questions(data, q_type, difficulty, subject, exam, chapter, source_chapter_id=chapter_id)
     except Exception as e:
+        _log_error("/api/generate", "save_questions", str(e), {"subject": subject, "chapter": chapter, "exam": exam})
         return {"questions": data, "save_warning": str(e)}
 
-    return {"questions": data}
+    uncovered = _run_coverage_check(headings, subject, exam, chapter, chapter_id, full_text)
+
+    return {
+        "questions": data,
+        "practical_pct": practical_pct,
+        "theory_pct": theory_pct,
+        "headings": headings,
+        "uncovered_headings_filled": uncovered,
+    }
+
+@app.post("/api/extract-paper")
+async def extract_paper(
+    file: UploadFile = File(...),
+    subject: str = Form(...),
+    class_level: str = Form(...),
+    board: str = Form(...),
+    year: str = Form(...),
+    exam_type: str = Form(...),
+    source_paper_id: Optional[str] = Form(None),
+):
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service key not configured")
+
+    content = await file.read()
+    try:
+        text = extract_text(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text found in the PDF.")
+
+    paper_id = source_paper_id or str(uuid.uuid4())
+    full_text = truncate_text(text, 60000)
+
+    prompt = f"""You are an expert CBSE question paper analyser. Extract every single question from the question paper below. Do not miss any question.
+
+MULTI-LINE QUESTION RULE: Many questions span multiple lines or have sub-parts. Treat the entire question — including all its lines, clauses, and sub-parts — as a single question_text. Never split one question across multiple entries just because it has line breaks.
+
+PAPER DETAILS:
+Subject: {subject}
+Class: {class_level}
+Board: {board}
+Year: {year}
+Exam Type: {exam_type}
+
+QUESTION TYPE DETECTION RULES (follow strictly):
+- MCQ: has four options labelled A B C D or 1 2 3 4
+- VSA (Very Short Answer): carries 2 marks
+- SA (Short Answer): carries 3 marks
+- LA (Long Answer): carries 5 marks
+- CBQ (Case Based Question): has a passage followed by sub-questions, carries 4 marks total
+
+DIFFICULTY TAGGING RULES:
+- easy: factual recall, definition-based, direct questions
+- medium: application-based, requires some understanding
+- hard: conceptual, why/how/which, multi-step reasoning, analytical
+
+For each question extract:
+- question_number: the number as it appears in the paper
+- question_text: the FULL question text including all sub-parts
+- question_type: one of MCQ, VSA, SA, LA, CBQ
+- marks: integer marks for this question
+- options: for MCQs only, object with keys A B C D — null for all other types
+- chapter: the chapter name if identifiable from context, otherwise null
+- difficulty_level: easy, medium, or hard
+
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
+[{{"question_number":"1","question_text":"full question text","question_type":"MCQ","marks":1,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}}]
+
+QUESTION PAPER:
+{full_text}"""
+
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = claude_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = response.content[0].text
+    stop_reason = getattr(response, "stop_reason", None)
+    data, parse_err = _parse_ai_questions_json(raw, stop_reason)
+    if parse_err:
+        return {"error": parse_err, "raw": raw}
+
+    try:
+        saved, skipped = _save_exam_questions(data, subject, class_level, board, year, exam_type, paper_id)
+    except Exception as e:
+        _log_error("/api/extract-paper", "save_exam_questions", str(e), {"subject": subject, "paper_id": paper_id})
+        return {"questions": data, "save_warning": str(e)}
+
+    return {
+        "success": True,
+        "source_paper_id": paper_id,
+        "questions_extracted": len(data),
+        "questions_saved": saved,
+        "duplicates_skipped": skipped,
+    }
+
+@app.post("/api/match-answer-key")
+async def match_answer_key(
+    file: UploadFile = File(...),
+    source_paper_id: str = Form(...),
+):
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service key not configured")
+
+    # Fetch all questions for this paper
+    try:
+        rows = _sb_get("exam_questions", {
+            "select": "id,question_text,question_type,keywords_json",
+            "source_paper_id": f"eq.{source_paper_id}",
+            "limit": 500,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch questions: {e}")
+    if not rows:
+        raise HTTPException(status_code=404, detail="No questions found for this source_paper_id.")
+
+    content = await file.read()
+    try:
+        text = extract_text(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+    if not text.strip():
+        raise HTTPException(status_code=400, detail="No text found in the answer key PDF.")
+
+    full_text = truncate_text(text, 60000)
+
+    question_list = "\n".join(
+        f'- id:{r["id"]} | type:{r.get("question_type","?")} | question:{r["question_text"][:120]}'
+        for r in rows
+    )
+
+    prompt = f"""You are an expert CBSE answer key analyser. Match every answer in the answer key below to its corresponding question.
+
+QUESTIONS TO MATCH (each has an id):
+{question_list}
+
+INSTRUCTIONS:
+- For each answer in the key, find the matching question by question number or by matching the question text.
+- For MCQ questions: correct_answer must be a single letter A, B, C, or D.
+- For all other types: correct_answer is the full answer text.
+- If you cannot confidently match an answer to a question, skip it — do not guess.
+
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
+[{{"id":"question-uuid-here","correct_answer":"A"}}]
+
+ANSWER KEY:
+{full_text}"""
+
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = claude_client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    raw = response.content[0].text
+    stop_reason = getattr(response, "stop_reason", None)
+    data, parse_err = _parse_ai_questions_json(raw, stop_reason)
+    if parse_err:
+        return {"error": parse_err, "raw": raw}
+
+    # Collect valid matched pairs first
+    existing_by_id = {r["id"]: r for r in rows}
+    valid_ids = set(existing_by_id.keys())
+    matched_pairs = []
+    failed = 0
+    for item in data:
+        q_id = (item.get("id") or "").strip()
+        answer = (item.get("correct_answer") or "").strip()
+        if not q_id or q_id not in valid_ids or not answer:
+            failed += 1
+            continue
+        matched_pairs.append({"id": q_id, "answer": answer})
+
+    # One Claude call to extract keywords for all matched answers
+    keywords_by_id = {}
+    if matched_pairs:
+        qa_list = "\n".join(
+            f'- id:{p["id"]} | answer:{p["answer"][:300]}'
+            for p in matched_pairs
+        )
+        kw_prompt = f"""Extract domain-relevant keywords from each answer below. Keywords are subject-specific terms, concepts, names, and formulas that a CBSE examiner would look for.
+
+For each entry return its id and a keywords array. Do not delete or omit any meaningful term.
+
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
+[{{"id":"question-uuid","keywords":["keyword1","keyword2"]}}]
+
+ANSWERS:
+{qa_list}"""
+        try:
+            kw_response = claude_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": kw_prompt}],
+            )
+            kw_data, kw_err = _parse_ai_questions_json(kw_response.content[0].text, getattr(kw_response, "stop_reason", None))
+            if kw_data and not kw_err:
+                for entry in kw_data:
+                    eid = (entry.get("id") or "").strip()
+                    kws = entry.get("keywords") or []
+                    if eid and isinstance(kws, list):
+                        keywords_by_id[eid] = kws
+        except Exception:
+            pass
+
+    # PATCH each question with answer + merged keywords
+    matched = 0
+    for pair in matched_pairs:
+        q_id = pair["id"]
+        answer = pair["answer"]
+        existing_kws = existing_by_id[q_id].get("keywords_json") or []
+        new_kws = keywords_by_id.get(q_id, [])
+        merged_kws = list(dict.fromkeys(existing_kws + [k for k in new_kws if k not in existing_kws]))
+        try:
+            url = f"{SUPABASE_URL}/rest/v1/exam_questions?id=eq.{q_id}"
+            body = json.dumps({"correct_answer": answer, "answer_pending": False, "keywords_json": merged_kws}).encode()
+            headers = {**_sb_headers(), "Prefer": "return=minimal"}
+            req = urllib.request.Request(url, data=body, headers=headers, method="PATCH")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+            matched += 1
+        except Exception as e:
+            _log_error("/api/match-answer-key", "patch_answer", str(e), {"question_id": q_id, "source_paper_id": source_paper_id})
+            failed += 1
+
+    return {
+        "success": True,
+        "source_paper_id": source_paper_id,
+        "answers_matched": matched,
+        "answers_failed": failed,
+        "total_questions": len(rows),
+    }
+
+@app.post("/api/upload-reference")
+async def upload_reference(
+    subject: str = Form(...),
+    class_level: str = Form(...),
+    board: str = Form(...),
+    upload_type: str = Form(...),
+    file_name: str = Form(...),
+    processing_notes: str = Form(""),
+):
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service key not configured")
+    try:
+        _sb_post("reference_uploads", [{
+            "file_name": file_name,
+            "upload_type": upload_type,
+            "subject": subject,
+            "class_level": class_level,
+            "board": board,
+            "processing_notes": processing_notes or None,
+        }])
+    except Exception as e:
+        _log_error("/api/upload-reference", "insert_metadata", str(e), {"file_name": file_name, "subject": subject})
+        raise HTTPException(status_code=500, detail=f"Could not save reference upload: {e}")
+    return {"success": True, "file_name": file_name}
+
+@app.get("/api/reference-uploads")
+async def get_reference_uploads(
+    subject: Optional[str] = Query(None),
+    class_level: Optional[str] = Query(None),
+    board: Optional[str] = Query(None),
+):
+    try:
+        params = {"select": "*", "order": "uploaded_at.desc", "limit": 200}
+        if subject: params["subject"] = f"eq.{subject}"
+        if class_level: params["class_level"] = f"eq.{class_level}"
+        if board: params["board"] = f"eq.{board}"
+        rows = _sb_get("reference_uploads", params)
+        return {"success": True, "count": len(rows), "uploads": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/errors")
+async def get_errors(limit: int = Query(50)):
+    try:
+        rows = _sb_get("processing_errors", {"select": "*", "order": "created_at.desc", "limit": limit})
+        return {"success": True, "count": len(rows), "errors": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
