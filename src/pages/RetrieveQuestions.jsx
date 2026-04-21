@@ -3,12 +3,6 @@ import { supabase } from '../lib/supabase'
 import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-const EXAMS = ['10th CBSE Board', '12th CBSE Board']
-const SUBJECTS = [
-  'Psychology', 'Mathematics', 'Physics', 'Chemistry', 'Biology',
-  'English', 'Hindi', 'History', 'Geography', 'Political Science',
-  'Economics', 'Computer Science'
-]
 
 function getChapters(exam, subject) {
   return CHAPTERS_BY_EXAM_SUBJECT[exam]?.[subject] || []
@@ -32,8 +26,25 @@ export default function RetrieveQuestions({ showStatus }) {
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(null)
 
+  const [availableExams, setAvailableExams] = useState([])
+  const [availableSubjects, setAvailableSubjects] = useState([])
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/meta/options`)
+      .then(r => r.json())
+      .then(data => { setAvailableExams(data.exams || []) })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!exam) { setAvailableSubjects([]); return }
+    fetch(`${API_BASE}/api/meta/options?exam=${encodeURIComponent(exam)}`)
+      .then(r => r.json())
+      .then(data => { setAvailableSubjects(data.subjects || []) })
+      .catch(() => {})
+  }, [exam])
 
   useEffect(() => {
     if (!exam || !subject) { setChapters([]); return }
@@ -119,16 +130,16 @@ export default function RetrieveQuestions({ showStatus }) {
         <div className="form-row">
           <div className="form-group">
             <label>Exam:</label>
-            <select value={exam} onChange={(e) => { setExam(e.target.value); setChapter('') }}>
+            <select value={exam} onChange={(e) => { setExam(e.target.value); setSubject(''); setChapter('') }}>
               <option value="">Select Exam</option>
-              {EXAMS.map(ex => <option key={ex} value={ex}>{ex}</option>)}
+              {availableExams.map(ex => <option key={ex} value={ex}>{ex}</option>)}
             </select>
           </div>
           <div className="form-group">
             <label>Subject:</label>
-            <select value={subject} onChange={(e) => { setSubject(e.target.value); setChapter('') }}>
-              <option value="">Select Subject</option>
-              {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+            <select value={subject} onChange={(e) => { setSubject(e.target.value); setChapter('') }} disabled={!exam || availableSubjects.length === 0}>
+              <option value="">{!exam ? 'Select exam first' : availableSubjects.length === 0 ? 'No subjects found' : 'Select Subject'}</option>
+              {availableSubjects.map(s => <option key={s} value={s}>{s}</option>)}
             </select>
           </div>
         </div>

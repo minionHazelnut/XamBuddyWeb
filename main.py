@@ -1115,6 +1115,47 @@ async def get_errors(limit: int = Query(50)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/meta/options")
+async def get_meta_options(
+    exam: Optional[str] = Query(None),
+    subject: Optional[str] = Query(None),
+):
+    exams_set, subjects_set = set(), set()
+    try:
+        rows = _sb_get("questions", {"select": "exam,subject", "limit": 5000})
+        for r in rows:
+            if r.get("exam"): exams_set.add(r["exam"])
+            if r.get("subject") and (not exam or r.get("exam") == exam):
+                subjects_set.add(r["subject"])
+    except Exception:
+        pass
+    try:
+        cm_params = {"select": "exam,subject", "limit": 2000}
+        if exam: cm_params["exam"] = f"eq.{exam}"
+        rows = _sb_get("chapter_meta", cm_params)
+        for r in rows:
+            if r.get("exam"): exams_set.add(r["exam"])
+            if r.get("subject"): subjects_set.add(r["subject"])
+    except Exception:
+        pass
+    return {"success": True, "exams": sorted(exams_set), "subjects": sorted(subjects_set)}
+
+
+@app.post("/api/log")
+async def log_frontend_error(request: Request):
+    try:
+        body = await request.json()
+        _log_error(
+            body.get("endpoint") or "frontend",
+            body.get("stage") or "unknown",
+            body.get("message") or "",
+            body.get("context") or {}
+        )
+    except Exception:
+        pass
+    return {"success": True}
+
+
 @app.post("/api/extract-chapter-title")
 async def extract_chapter_title(
     file: UploadFile = File(...),

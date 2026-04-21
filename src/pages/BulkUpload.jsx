@@ -1,8 +1,7 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-const EXAMS = ['10th CBSE Board', '12th CBSE Board']
 
 const BATCHES = [
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (1/2)' },
@@ -46,9 +45,17 @@ export default function BulkUpload({ showStatus }) {
   const [structure, setStructure] = useState({})
   const [chapters, setChapters] = useState([])
   const [extracting, setExtracting] = useState(false)
+  const [availableExams, setAvailableExams] = useState([])
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [results, setResults] = useState([])
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/meta/options`)
+      .then(r => r.json())
+      .then(data => setAvailableExams(data.exams || []))
+      .catch(() => {})
+  }, [])
 
   function handleFolderChange(e) {
     const struct = parseFolderStructure(e.target.files)
@@ -171,15 +178,36 @@ export default function BulkUpload({ showStatus }) {
             grandTotal += result.questions.length
           } else if (result.error) {
             chResult.errors.push(`${batch.label}: ${result.error}`)
+            fetch(`${API_BASE}/api/log`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Failed to generate ${batch.q_type} for "${ch.title}" (${ch.subject}): ${result.error}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type, num_q_requested: batch.num_q, num_q_generated: 0 } })
+            }).catch(() => {})
             if (res.status === 422) {
               fatalMismatch = true
+              fetch(`${API_BASE}/api/log`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ endpoint: 'bulk-upload', stage: 'chapter_mismatch', message: `Chapter title mismatch: "${ch.title}" (${ch.subject}) — all remaining batches skipped`, context: { subject: ch.subject, chapter: ch.title, exam, batches_completed: bi, batches_skipped: BATCHES.length - bi - 1, generated_so_far: chResult.saved } })
+              }).catch(() => {})
               showStatus(`Mismatch detected for "${ch.title}" — check Error Log`, 'error')
               break
             }
           }
         } catch (err) {
           chResult.errors.push(`${batch.label}: ${err.message}`)
+          fetch(`${API_BASE}/api/log`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Network/server error for "${ch.title}" (${ch.subject}), batch ${batch.label}: ${err.message}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type } })
+          }).catch(() => {})
         }
+      }
+
+      // Log chapter summary if any failures
+      if (chResult.errors.length > 0 || fatalMismatch) {
+        const successTypes = BATCHES.filter((b, i) => i < BATCHES.length && !chResult.errors.some(e => e.startsWith(b.label))).map(b => b.label)
+        fetch(`${API_BASE}/api/log`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint: 'bulk-upload', stage: 'chapter_summary', message: `Chapter "${ch.title}" (${ch.subject}): ${chResult.saved} questions generated. Successful: [${successTypes.join(', ')}]. Failed: [${chResult.errors.map(e => e.split(':')[0]).join(', ')}]`, context: { subject: ch.subject, chapter: ch.title, exam, total_generated: chResult.saved, failed_batches: chResult.errors.length, mismatch: fatalMismatch } })
+        }).catch(() => {})
       }
 
       allResults.push({ ...chResult, mismatch: fatalMismatch })
@@ -211,7 +239,7 @@ export default function BulkUpload({ showStatus }) {
             <label>Exam / Grade:</label>
             <select value={exam} onChange={e => setExam(e.target.value)}>
               <option value="">Select Exam</option>
-              {EXAMS.map(ex => <option key={ex} value={ex}>{ex}</option>)}
+              {availableExams.map(ex => <option key={ex} value={ex}>{ex}</option>)}
             </select>
           </div>
           <div className="form-group">

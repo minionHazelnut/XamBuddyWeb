@@ -3,7 +3,6 @@ import { supabase } from '../lib/supabase'
 import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-const EXAMS = ['10th CBSE Board', '12th CBSE Board']
 const SUBJECTS = [
   'Psychology', 'Mathematics', 'Physics', 'Chemistry', 'Biology',
   'English', 'Hindi', 'History', 'Geography', 'Political Science',
@@ -15,6 +14,7 @@ function getChapters(exam, subject) {
 }
 
 export default function GenerateQuestions({ showStatus }) {
+  const [availableExams, setAvailableExams] = useState([])
   const [exam, setExam] = useState('')
   const [subject, setSubject] = useState('')
   const [chapter, setChapter] = useState('')
@@ -37,7 +37,13 @@ export default function GenerateQuestions({ showStatus }) {
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
 
-  useEffect(() => { fetchChapterHistory() }, [])
+  useEffect(() => {
+    fetchChapterHistory()
+    fetch(`${API_BASE}/api/meta/options`)
+      .then(r => r.json())
+      .then(data => setAvailableExams(data.exams || []))
+      .catch(() => {})
+  }, [])
 
   useEffect(() => {
     if (!exam || !subject) { setChapters([]); return }
@@ -321,7 +327,7 @@ export default function GenerateQuestions({ showStatus }) {
             <label>Exam:</label>
             <select value={exam} onChange={(e) => { setExam(e.target.value); setChapter('') }}>
               <option value="">Select Exam</option>
-              {EXAMS.map(ex => <option key={ex} value={ex}>{ex}</option>)}
+              {availableExams.map(ex => <option key={ex} value={ex}>{ex}</option>)}
             </select>
           </div>
           <div className="form-group">

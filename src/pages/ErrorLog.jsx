@@ -45,11 +45,18 @@ export default function ErrorLog({ showStatus }) {
                 <span style={{ background: '#e8f0ee', padding: '2px 8px', borderRadius: '4px', fontSize: '12px' }}>{err.stage}</span>
                 <span style={{ color: '#6b8a80', fontSize: '12px', marginLeft: 'auto' }}>{new Date(err.created_at).toLocaleString()}</span>
               </div>
-              <p style={{ fontSize: '14px', color: '#333', marginBottom: err.context_json ? '6px' : 0 }}>{err.error_message}</p>
+              <p style={{ fontSize: '14px', color: '#333', marginBottom: '6px' }}>{err.error_message}</p>
               {err.context_json && Object.keys(err.context_json).length > 0 && (
-                <p style={{ fontSize: '12px', color: '#6b8a80', fontFamily: 'monospace', margin: 0 }}>
-                  {JSON.stringify(err.context_json)}
-                </p>
+                <div style={{ fontSize: '12px', color: '#6b8a80', display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
+                  {err.context_json.subject && <span><strong>Subject:</strong> {err.context_json.subject}</span>}
+                  {err.context_json.chapter && <span><strong>Chapter:</strong> {err.context_json.chapter}</span>}
+                  {err.context_json.exam && <span><strong>Exam:</strong> {err.context_json.exam}</span>}
+                  {err.context_json.q_type && <span><strong>Type:</strong> {err.context_json.q_type}</span>}
+                  {err.context_json.num_q_generated !== undefined && <span><strong>Generated:</strong> {err.context_json.num_q_generated}/{err.context_json.num_q_requested}</span>}
+                  {err.context_json.total_generated !== undefined && <span><strong>Total saved:</strong> {err.context_json.total_generated}</span>}
+                  {err.context_json.failed_batches !== undefined && <span><strong>Failed batches:</strong> {err.context_json.failed_batches}</span>}
+                  {err.context_json.match_ratio !== undefined && <span><strong>Match ratio:</strong> {Math.round(err.context_json.match_ratio * 100)}%</span>}
+                </div>
               )}
             </div>
           ))}
