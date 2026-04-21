@@ -161,14 +161,17 @@ export default function BulkUpload({ showStatus }) {
       }
     } catch {}
 
+    const EMPTY_BREAKDOWN = { mcq: 0, vsa: 0, short: 0, long: 0, conceptual: 0, cbq: 0 }
     const allResults = []
     let grandTotal = 0
+    const grandBreakdown = { ...EMPTY_BREAKDOWN }
 
     for (let ci = 0; ci < chapters.length; ci++) {
       const ch = chapters[ci]
-      setProgress({ chapterIdx: ci + 1, total: chapters.length, subject: ch.subject, title: ch.title, batch: 0, totalBatches: BATCHES.length, batchLabel: 'Checking...', savedTotal: grandTotal })
+      const chapterBreakdown = { ...EMPTY_BREAKDOWN }
+      setProgress({ chapterIdx: ci + 1, total: chapters.length, subject: ch.subject, title: ch.title, batch: 0, totalBatches: BATCHES.length, batchLabel: 'Checking...', savedTotal: grandTotal, chapterBreakdown, grandBreakdown: { ...grandBreakdown } })
 
-      const chResult = { subject: ch.subject, title: ch.title, saved: 0, skipped: 0, errors: [] }
+      const chResult = { subject: ch.subject, title: ch.title, saved: 0, skipped: 0, errors: [], breakdown: { ...EMPTY_BREAKDOWN } }
       let fatalMismatch = false
       let firstBatchRun = true
 
@@ -211,9 +214,14 @@ export default function BulkUpload({ showStatus }) {
 
           const result = await res.json()
           if (result.questions) {
-            chResult.saved += result.questions.length
-            grandTotal += result.questions.length
-            existingCounts[typeKey] = alreadyHave + result.questions.length
+            const count = result.questions.length
+            chResult.saved += count
+            chResult.breakdown[batch.q_type] = (chResult.breakdown[batch.q_type] || 0) + count
+            grandTotal += count
+            grandBreakdown[batch.q_type] = (grandBreakdown[batch.q_type] || 0) + count
+            chapterBreakdown[batch.q_type] = (chapterBreakdown[batch.q_type] || 0) + count
+            existingCounts[typeKey] = alreadyHave + count
+            setProgress(p => ({ ...p, savedTotal: grandTotal, chapterBreakdown: { ...chapterBreakdown }, grandBreakdown: { ...grandBreakdown } }))
           } else if (result.error) {
             chResult.errors.push(`${batch.label}: ${result.error}`)
             fetch(`${API_BASE}/api/log`, {
@@ -377,19 +385,62 @@ export default function BulkUpload({ showStatus }) {
       {/* Progress */}
       {processing && progress && (
         <div style={{ padding: '16px', background: '#f0f4f3', borderRadius: '10px', border: '1px solid #c8d8d5', marginBottom: '16px' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '6px' }}>
-            <span style={{ fontWeight: '600', color: '#2d4a47' }}>
-              Chapter {progress.chapterIdx}/{progress.total}: {progress.subject} — {progress.title}
+          {/* Header */}
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+            <span style={{ fontWeight: '600', color: '#2d4a47', fontSize: '14px' }}>
+              Chapter {progress.chapterIdx}/{progress.total}: <span style={{ color: '#4a6e6a' }}>{progress.subject}</span> — {progress.title}
             </span>
-            <span style={{ color: '#6b8a80', fontSize: '13px' }}>Batch {progress.batch}/{progress.totalBatches}: {progress.batchLabel}</span>
+            <span style={{ color: '#6b8a80', fontSize: '13px' }}>{progress.batchLabel}</span>
           </div>
-          <div style={{ background: '#c8d8d5', borderRadius: '4px', height: '8px', overflow: 'hidden', marginBottom: '6px' }}>
-            <div style={{
-              background: '#4a6e6a', height: '100%', transition: 'width 0.3s',
-              width: `${((progress.chapterIdx - 1 + progress.batch / progress.totalBatches) / progress.total) * 100}%`
-            }} />
+
+          {/* Progress bar */}
+          <div style={{ background: '#c8d8d5', borderRadius: '4px', height: '6px', overflow: 'hidden', marginBottom: '12px' }}>
+            <div style={{ background: '#4a6e6a', height: '100%', transition: 'width 0.4s', width: `${((progress.chapterIdx - 1 + progress.batch / progress.totalBatches) / progress.total) * 100}%` }} />
           </div>
-          <p style={{ fontSize: '13px', color: '#6b8a80', margin: 0 }}>{progress.savedTotal} questions generated so far</p>
+
+          {/* Current chapter breakdown */}
+          <div style={{ marginBottom: '10px' }}>
+            <p style={{ fontSize: '11px', color: '#6b8a80', margin: '0 0 5px 0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>This chapter</p>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              {[
+                { key: 'mcq', label: 'MCQ' },
+                { key: 'vsa', label: 'VSA' },
+                { key: 'short', label: 'Short Ans' },
+                { key: 'long', label: 'Long Ans' },
+                { key: 'conceptual', label: 'Conceptual' },
+                { key: 'cbq', label: 'CBQ' },
+              ].map(({ key, label }) => {
+                const count = progress.chapterBreakdown?.[key] || 0
+                return (
+                  <span key={key} style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: count > 0 ? '600' : '400', background: count > 0 ? '#4a6e6a' : '#e0e8e6', color: count > 0 ? '#fff' : '#6b8a80' }}>
+                    {label}: {count}
+                  </span>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Grand total breakdown */}
+          <div style={{ borderTop: '1px solid #c8d8d5', paddingTop: '10px' }}>
+            <p style={{ fontSize: '11px', color: '#6b8a80', margin: '0 0 5px 0', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Grand total — {progress.savedTotal} questions</p>
+            <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+              {[
+                { key: 'mcq', label: 'MCQ' },
+                { key: 'vsa', label: 'VSA' },
+                { key: 'short', label: 'Short Ans' },
+                { key: 'long', label: 'Long Ans' },
+                { key: 'conceptual', label: 'Conceptual' },
+                { key: 'cbq', label: 'CBQ' },
+              ].map(({ key, label }) => {
+                const count = progress.grandBreakdown?.[key] || 0
+                return (
+                  <span key={key} style={{ padding: '3px 10px', borderRadius: '12px', fontSize: '12px', background: '#e8f0ee', color: '#2d4a47' }}>
+                    {label}: <strong>{count}</strong>
+                  </span>
+                )
+              })}
+            </div>
+          </div>
         </div>
       )}
 
