@@ -3,6 +3,18 @@ import { supabase } from '../lib/supabase'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
+const SMALL_WORDS = new Set(['a','an','the','and','but','or','nor','for','yet','so','at','by','in','of','on','to','up','as','is','via','with','from','into','onto','over','per','than','vs'])
+
+function toTitleCase(text) {
+  if (!text) return text
+  return text.trim().split(' ').map((word, i) => {
+    if (word.includes('-')) {
+      return word.split('-').map((p, j) => (i === 0 && j === 0) || !SMALL_WORDS.has(p.toLowerCase()) ? p.charAt(0).toUpperCase() + p.slice(1).toLowerCase() : p.toLowerCase()).join('-')
+    }
+    return (i === 0 || !SMALL_WORDS.has(word.toLowerCase())) ? word.charAt(0).toUpperCase() + word.slice(1).toLowerCase() : word.toLowerCase()
+  }).join(' ')
+}
+
 const BATCHES = [
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (1/2)' },
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (2/2)' },
@@ -87,7 +99,7 @@ export default function BulkUpload({ showStatus }) {
           const data = await res.json()
           allChapters.push({
             subject, file,
-            title: data.chapter_title || file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' '),
+            title: toTitleCase(data.chapter_title || file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ')),
             chapterNumber: data.chapter_number,
             confidence: data.confidence || 'low',
             status: 'pending',
@@ -96,7 +108,7 @@ export default function BulkUpload({ showStatus }) {
         } catch {
           allChapters.push({
             subject, file,
-            title: file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' '),
+            title: toTitleCase(file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ')),
             chapterNumber: null,
             confidence: 'low',
             status: 'pending',

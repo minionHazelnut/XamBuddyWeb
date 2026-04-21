@@ -82,6 +82,25 @@ def _log_error(endpoint: str, stage: str, error: str, context: dict = None):
 
 # ---------- Question helpers ----------
 
+_SMALL_WORDS = {'a','an','the','and','but','or','nor','for','yet','so','at','by','in','of','on','to','up','as','is','via','with','from','into','onto','over','per','than','vs'}
+
+def _to_title_case(text: str) -> str:
+    if not text:
+        return text
+    words = text.strip().split()
+    result = []
+    for i, word in enumerate(words):
+        # Preserve hyphenated words with title case on each part
+        if '-' in word:
+            parts = word.split('-')
+            cased = '-'.join(p.capitalize() if (i == 0 or p.lower() not in _SMALL_WORDS) else p.lower() for j, p in enumerate(parts))
+            result.append(cased)
+        elif i == 0 or word.lower() not in _SMALL_WORDS:
+            result.append(word.capitalize())
+        else:
+            result.append(word.lower())
+    return ' '.join(result)
+
 def _difficulty_for_db(difficulty: str) -> str:
     return "medium" if difficulty == "mixed" else difficulty
 
@@ -1179,7 +1198,7 @@ async def extract_chapter_title(
                 ch_order = r.get("chapter_order")
                 return {
                     "success": True,
-                    "chapter_title": r["chapter"],
+                    "chapter_title": _to_title_case(r["chapter"]),
                     "chapter_number": ch_order if ch_order and ch_order != 999 else None,
                     "confidence": "cached",
                     "file_name": filename,
@@ -1188,7 +1207,7 @@ async def extract_chapter_title(
             pass
 
     content = await file.read()
-    fallback_title = filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ").replace("-", " ").strip()
+    fallback_title = _to_title_case(filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ").replace("-", " ").strip())
 
     # Extract only the first page — the chapter title is always there
     try:
@@ -1235,7 +1254,7 @@ FIRST PAGE TEXT:
         start, end = raw.find("{"), raw.rfind("}") + 1
         if start != -1 and end > start:
             parsed = json.loads(raw[start:end])
-            title = (parsed.get("chapter_title") or "").strip()
+            title = _to_title_case((parsed.get("chapter_title") or "").strip())
             ch_num = parsed.get("chapter_number") or regex_ch_num
             if title and len(title) > 3:
                 return {"success": True, "chapter_title": title, "chapter_number": ch_num, "confidence": "high", "file_name": filename}
