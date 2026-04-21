@@ -34,9 +34,23 @@ export default function GenerateQuestions({ showStatus }) {
   const [chapterHistory, setChapterHistory] = useState([])
   const [historyLoading, setHistoryLoading] = useState(false)
 
-  const chapters = getChapters(exam, subject)
+  const [chapters, setChapters] = useState([])
+  const [loadingChapters, setLoadingChapters] = useState(false)
 
   useEffect(() => { fetchChapterHistory() }, [])
+
+  useEffect(() => {
+    if (!exam || !subject) { setChapters([]); return }
+    setLoadingChapters(true)
+    fetch(`${API_BASE}/api/chapters?exam=${encodeURIComponent(exam)}&subject=${encodeURIComponent(subject)}`)
+      .then(r => r.json())
+      .then(data => {
+        const db = data.chapters || []
+        setChapters(db.length > 0 ? db : getChapters(exam, subject))
+      })
+      .catch(() => setChapters(getChapters(exam, subject)))
+      .finally(() => setLoadingChapters(false))
+  }, [exam, subject])
 
   async function fetchChapterHistory() {
     setHistoryLoading(true)
@@ -321,8 +335,8 @@ export default function GenerateQuestions({ showStatus }) {
 
         <div className="form-group">
           <label>Chapter:</label>
-          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0}>
-            <option value="">{chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
+          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0 || loadingChapters}>
+            <option value="">{loadingChapters ? 'Loading chapters...' : chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
             {chapters.map(ch => <option key={ch} value={ch}>{ch}</option>)}
           </select>
         </div>

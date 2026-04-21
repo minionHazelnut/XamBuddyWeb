@@ -436,10 +436,10 @@ CHAPTER CONTENT (excerpt):
         pass
     return uncovered
 
-def _get_or_store_chapter_meta(subject, exam, chapter, text):
+def _get_or_store_chapter_meta(subject, exam, chapter, text, chapter_order=None, file_name=None):
     try:
         rows = _sb_get("chapter_meta", {
-            "select": "id,practical_pct,theory_pct,headings",
+            "select": "id,practical_pct,theory_pct,headings,chapter_order",
             "subject": f"eq.{subject}",
             "exam": f"eq.{exam}",
             "chapter": f"eq.{chapter}",
@@ -447,15 +447,25 @@ def _get_or_store_chapter_meta(subject, exam, chapter, text):
         })
         if rows:
             r = rows[0]
+            if chapter_order is not None and (r.get("chapter_order") is None or r.get("chapter_order") == 999):
+                try:
+                    _sb_patch("chapter_meta", r["id"], {"chapter_order": chapter_order})
+                except Exception:
+                    pass
             return r["id"], r["practical_pct"], r["theory_pct"], r.get("headings") or []
     except Exception:
         pass
     practical_pct, theory_pct, headings = _analyse_chapter(text, subject)
     chapter_id = str(uuid.uuid4())
     try:
-        _sb_post("chapter_meta", [{"id": chapter_id, "subject": subject, "exam": exam,
-                                    "chapter": chapter, "practical_pct": practical_pct,
-                                    "theory_pct": theory_pct, "headings": headings}])
+        row = {"id": chapter_id, "subject": subject, "exam": exam,
+               "chapter": chapter, "practical_pct": practical_pct,
+               "theory_pct": theory_pct, "headings": headings}
+        if chapter_order is not None:
+            row["chapter_order"] = chapter_order
+        if file_name:
+            row["file_name"] = file_name
+        _sb_post("chapter_meta", [row])
     except Exception:
         pass
     return chapter_id, practical_pct, theory_pct, headings
@@ -647,6 +657,7 @@ async def generate_from_pdf(
     subject: str = Form("general"),
     exam: str = Form("general"),
     chapter: str = Form(...),
+    chapter_order: Optional[int] = Form(None),
 ):
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
@@ -667,8 +678,24 @@ async def generate_from_pdf(
 
     full_text = truncate_text(text, 80000)
 
+    # Consistency check: verify chapter name matches PDF content
+    chapter_words = [w for w in re.sub(r'[^a-z\s]', '', chapter.lower()).split() if len(w) >= 4]
+    if chapter_words:
+        first_chunk = full_text[:4000].lower()
+        matched = sum(1 for w in chapter_words if w in first_chunk)
+        match_ratio = matched / len(chapter_words)
+        if match_ratio < 0.25:
+            err_msg = (f"Chapter mismatch: '{chapter}' does not appear to match the uploaded PDF "
+                       f"({matched}/{len(chapter_words)} title words found in PDF). "
+                       f"Please verify you selected the correct chapter and uploaded the correct PDF.")
+            _log_error("/api/generate", "chapter_title_mismatch", err_msg,
+                       {"subject": subject, "exam": exam, "chapter": chapter, "match_ratio": round(match_ratio, 2)})
+            return JSONResponse(status_code=422, content={"error": err_msg})
+
     # Step 1: analyse chapter — get practical/theory split and headings
-    chapter_id, practical_pct, theory_pct, headings = _get_or_store_chapter_meta(subject, exam, chapter, full_text)
+    chapter_id, practical_pct, theory_pct, headings = _get_or_store_chapter_meta(
+        subject, exam, chapter, full_text, chapter_order=chapter_order, file_name=file.filename
+    )
 
     practical_count = round(num_q * practical_pct / 100)
     theory_count = num_q - practical_count
@@ -1087,6 +1114,76 @@ async def get_errors(limit: int = Query(50)):
         return {"success": True, "count": len(rows), "errors": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/extract-chapter-title")
+async def extract_chapter_title(
+    file: UploadFile = File(...),
+    subject: str = Form(""),
+    exam: str = Form(""),
+):
+    content = await file.read()
+    try:
+        text = extract_text(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+
+    snippet = text[:3000]
+    ch_num_match = re.search(r'chapter\s+(\d+)', text[:1000].lower())
+    regex_ch_num = int(ch_num_match.group(1)) if ch_num_match else None
+
+    fallback_title = file.filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ").replace("-", " ").strip()
+
+    if not CLAUDE_API_KEY:
+        return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": file.filename}
+
+    prompt = f"""This is the beginning of a CBSE textbook chapter PDF. Identify the chapter title.
+
+The chapter title is the main prominent heading at the start of the chapter — not the book title, not a sub-heading, not a table of contents entry. It is usually the largest text near the top.
+
+Return ONLY this JSON (no other text):
+{{"chapter_title": "exact chapter title as written in the textbook", "chapter_number": 1}}
+
+If chapter number is not visible, use null for chapter_number.
+
+CONTENT (first part of PDF):
+{snippet}"""
+
+    try:
+        claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+        response = claude_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=128,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        start, end = raw.find("{"), raw.rfind("}") + 1
+        if start != -1 and end > start:
+            parsed = json.loads(raw[start:end])
+            title = (parsed.get("chapter_title") or "").strip()
+            ch_num = parsed.get("chapter_number") or regex_ch_num
+            if title and len(title) > 3:
+                return {"success": True, "chapter_title": title, "chapter_number": ch_num, "confidence": "high", "file_name": file.filename}
+    except Exception as e:
+        _log_error("/api/extract-chapter-title", "claude_extract", str(e), {"file": file.filename})
+
+    return {"success": False, "chapter_title": fallback_title, "chapter_number": regex_ch_num, "confidence": "low", "file_name": file.filename}
+
+
+@app.get("/api/chapters")
+async def get_chapters(
+    exam: Optional[str] = Query(None),
+    subject: Optional[str] = Query(None),
+):
+    try:
+        params = {"select": "chapter,chapter_order", "order": "chapter_order.asc,chapter.asc", "limit": 200}
+        if exam: params["exam"] = f"eq.{exam}"
+        if subject: params["subject"] = f"eq.{subject}"
+        rows = _sb_get("chapter_meta", params)
+        chapters = [r["chapter"] for r in rows if r.get("chapter")]
+        return {"success": True, "chapters": chapters}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn

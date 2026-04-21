@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import Dashboard from './Dashboard'
 import GenerateQuestions from './GenerateQuestions'
+import BulkUpload from './BulkUpload'
 import RetrieveQuestions from './RetrieveQuestions'
 import ExamPaperUploads from './ExamPaperUploads'
 import ExamPaperRetrieve from './ExamPaperRetrieve'
@@ -34,6 +35,7 @@ export default function AdminDashboard() {
   const menuItems = [
     { id: 'dashboard', label: 'Dashboard', icon: '\u2302' },
     { id: 'generate', label: 'Generate Questions', icon: '\u2B06' },
+    { id: 'bulk-upload', label: 'Bulk Chapter Upload', icon: '\u{1F4C2}' },
     { id: 'retrieve', label: 'Retrieve Questions', icon: '\u2B07' },
     { id: 'exam-uploads', label: 'Exam Paper Uploads', icon: '\u{1F4C4}' },
     { id: 'exam-retrieve', label: 'Exam Paper Retrieve', icon: '\u{1F50D}' },
@@ -80,6 +82,7 @@ export default function AdminDashboard() {
 
         {activeTab === 'dashboard' && <Dashboard />}
         {activeTab === 'generate' && <GenerateQuestions showStatus={showStatus} />}
+        {activeTab === 'bulk-upload' && <BulkUpload showStatus={showStatus} />}
         {activeTab === 'retrieve' && <RetrieveQuestions showStatus={showStatus} />}
         {activeTab === 'exam-uploads' && <ExamPaperUploads showStatus={showStatus} />}
         {activeTab === 'exam-retrieve' && <ExamPaperRetrieve showStatus={showStatus} />}

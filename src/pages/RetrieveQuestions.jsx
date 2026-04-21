@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
@@ -32,7 +32,21 @@ export default function RetrieveQuestions({ showStatus }) {
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(null)
 
-  const chapters = getChapters(exam, subject)
+  const [chapters, setChapters] = useState([])
+  const [loadingChapters, setLoadingChapters] = useState(false)
+
+  useEffect(() => {
+    if (!exam || !subject) { setChapters([]); return }
+    setLoadingChapters(true)
+    fetch(`${API_BASE}/api/chapters?exam=${encodeURIComponent(exam)}&subject=${encodeURIComponent(subject)}`)
+      .then(r => r.json())
+      .then(data => {
+        const db = data.chapters || []
+        setChapters(db.length > 0 ? db : getChapters(exam, subject))
+      })
+      .catch(() => setChapters(getChapters(exam, subject)))
+      .finally(() => setLoadingChapters(false))
+  }, [exam, subject])
 
   async function handleRetrieve(e) {
     e.preventDefault()
@@ -121,8 +135,8 @@ export default function RetrieveQuestions({ showStatus }) {
 
         <div className="form-group">
           <label>Chapter:</label>
-          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0}>
-            <option value="">{chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
+          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0 || loadingChapters}>
+            <option value="">{loadingChapters ? 'Loading chapters...' : chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
             {chapters.map(ch => <option key={ch} value={ch}>{ch}</option>)}
           </select>
         </div>
