@@ -25,6 +25,8 @@ export default function GenerateQuestions({ showStatus }) {
   const [existingPdfUrl, setExistingPdfUrl] = useState(null)
   const [checkingPdf, setCheckingPdf] = useState(false)
   const [generating, setGenerating] = useState(false)
+  const [generatingAll, setGeneratingAll] = useState(false)
+  const [allProgress, setAllProgress] = useState(null)
   const [existingQuestions, setExistingQuestions] = useState([])
   const [newQuestions, setNewQuestions] = useState([])
   const [existingCount, setExistingCount] = useState(0)
@@ -139,6 +141,75 @@ export default function GenerateQuestions({ showStatus }) {
         chapter_pdf: urlData.publicUrl,
       })
     } catch {}
+  }
+
+  const GENERATE_ALL_BATCHES = [
+    { q_type: 'mcq',        num_q: 25, label: 'MCQs (1/2)' },
+    { q_type: 'mcq',        num_q: 25, label: 'MCQs (2/2)' },
+    { q_type: 'vsa',        num_q: 30, label: 'Very Short Answers' },
+    { q_type: 'short',      num_q: 30, label: 'Short Answers' },
+    { q_type: 'long',       num_q: 15, label: 'Long Answers' },
+    { q_type: 'conceptual', num_q: 15, label: 'Conceptual' },
+    { q_type: 'cbq',        num_q: 10, label: 'Case-Based Questions' },
+  ]
+
+  async function handleGenerateAll(e) {
+    e.preventDefault()
+    if (!file && !existingPdfUrl) { showStatus('Please select a PDF file', 'error'); return }
+    if (!chapter) { showStatus('Please select a chapter', 'error'); return }
+
+    setGeneratingAll(true)
+    setAllProgress({ current: 0, total: GENERATE_ALL_BATCHES.length, label: '', saved: 0, errors: [] })
+
+    const { grade, board: boardStr } = parseExam(exam)
+    let pdfFile = file
+    if (!pdfFile && existingPdfUrl) {
+      const res = await fetch(existingPdfUrl)
+      const blob = await res.blob()
+      pdfFile = new File([blob], 'chapter.pdf', { type: 'application/pdf' })
+    }
+
+    let totalSaved = 0
+    const errors = []
+
+    for (let i = 0; i < GENERATE_ALL_BATCHES.length; i++) {
+      const batch = GENERATE_ALL_BATCHES[i]
+      setAllProgress({ current: i + 1, total: GENERATE_ALL_BATCHES.length, label: batch.label, saved: totalSaved, errors })
+
+      try {
+        const formData = new FormData()
+        formData.append('file', pdfFile)
+        formData.append('exam', exam)
+        formData.append('subject', subject)
+        formData.append('chapter', chapter)
+        formData.append('q_type', batch.q_type)
+        formData.append('difficulty', 'mixed')
+        formData.append('num_q', batch.num_q)
+
+        if (i === 0) {
+          const [res] = await Promise.all([
+            fetch(`${API_BASE}/api/generate`, { method: 'POST', body: formData }),
+            uploadChapterPdf(grade, boardStr),
+          ])
+          const result = await res.json()
+          if (result.questions) totalSaved += result.questions.length
+          else if (result.error) errors.push(`${batch.label}: ${result.error}`)
+        } else {
+          const res = await fetch(`${API_BASE}/api/generate`, { method: 'POST', body: formData })
+          const result = await res.json()
+          if (result.questions) totalSaved += result.questions.length
+          else if (result.error) errors.push(`${batch.label}: ${result.error}`)
+        }
+      } catch (err) {
+        errors.push(`${batch.label}: ${err.message}`)
+      }
+    }
+
+    setAllProgress({ current: GENERATE_ALL_BATCHES.length, total: GENERATE_ALL_BATCHES.length, label: 'Done', saved: totalSaved, errors })
+    setGeneratingAll(false)
+    showStatus(`Generate All complete — ${totalSaved} questions saved${errors.length ? `, ${errors.length} errors` : ''}`, errors.length ? 'error' : 'success')
+    await fetchExisting()
+    fetchChapterHistory()
   }
 
   async function handleGenerate(e) {
@@ -261,10 +332,10 @@ export default function GenerateQuestions({ showStatus }) {
             <label>Question Type:</label>
             <select value={qType} onChange={(e) => setQType(e.target.value)}>
               <option value="mcq">MCQ</option>
+              <option value="vsa">Very Short Answer</option>
               <option value="short">Short Answer</option>
               <option value="long">Long Answer</option>
               <option value="conceptual">Conceptual</option>
-              <option value="mixed">Mixed</option>
               <option value="cbq">Case-Based (CBQ)</option>
             </select>
           </div>
@@ -283,10 +354,32 @@ export default function GenerateQuestions({ showStatus }) {
           </div>
         </div>
 
-        <button type="submit" disabled={generating}>
-          {generating ? 'Generating...' : 'Generate Questions'}
-        </button>
+        <div style={{ display: 'flex', gap: '12px', alignItems: 'center', flexWrap: 'wrap' }}>
+          <button type="submit" disabled={generating || generatingAll}>
+            {generating ? 'Generating...' : 'Generate Questions'}
+          </button>
+          <button type="button" onClick={handleGenerateAll} disabled={generating || generatingAll}
+            style={{ background: '#2d4a47', color: '#fff', border: 'none', borderRadius: '8px', padding: '10px 20px', cursor: 'pointer', fontWeight: '600', fontSize: '14px' }}>
+            {generatingAll ? 'Generating All...' : '⚡ Generate All (150 questions)'}
+          </button>
+        </div>
       </form>
+
+      {generatingAll && allProgress && (
+        <div style={{ marginTop: '16px', padding: '16px', background: '#f0f4f3', borderRadius: '10px', border: '1px solid #c8d8d5' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
+            <span style={{ fontWeight: '600', color: '#2d4a47' }}>Generating: {allProgress.label}</span>
+            <span style={{ color: '#6b8a80', fontSize: '13px' }}>{allProgress.current} / {allProgress.total} batches</span>
+          </div>
+          <div style={{ background: '#c8d8d5', borderRadius: '4px', height: '8px', overflow: 'hidden' }}>
+            <div style={{ background: '#4a6e6a', height: '100%', width: `${(allProgress.current / allProgress.total) * 100}%`, transition: 'width 0.3s' }} />
+          </div>
+          <p style={{ marginTop: '8px', fontSize: '13px', color: '#6b8a80' }}>{allProgress.saved} questions saved so far</p>
+          {allProgress.errors.length > 0 && allProgress.errors.map((e, i) => (
+            <p key={i} style={{ fontSize: '12px', color: '#c0392b', margin: '2px 0' }}>{e}</p>
+          ))}
+        </div>
+      )}
 
       {/* Loading overlay */}
       {generating && (

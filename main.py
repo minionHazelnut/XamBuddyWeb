@@ -131,6 +131,10 @@ def _ai_item_is_clean_for_db(q: dict, row_type: str) -> bool:
         ans = (q.get("answer") or "").strip()
         if len(ans) < 20:
             return False
+    if row_type == "vsa":
+        ans = (q.get("answer") or "").strip()
+        if len(ans) < 5:
+            return False
     return True
 
 def _get_existing_fingerprints(exam, subject, chapter_db):
@@ -465,6 +469,7 @@ FORMAT_EXAMPLES = {
     "conceptual": '[{"question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3","keyword4","keyword5","keyword6"],"is_practical":false}]',
     "mixed": '[{"question_type":"mcq","question":"string","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false},{"question_type":"short","question":"string","answer":"string","explanation":"string","keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
     "cbq": '[{"question_type":"cbq","passage":"60-100 word real-world/scenario passage","sub_questions":[{"question":"string","difficulty":"easy","answer":"string"},{"question":"string","difficulty":"medium","answer":"string"},{"question":"string","difficulty":"hard","answer":"string"}],"keywords":["keyword1","keyword2","keyword3"],"is_practical":false}]',
+    "vsa": '[{"question":"string","answer":"string","keywords":["keyword1","keyword2"],"is_practical":false}]',
 }
 
 TYPE_RULES = {
@@ -505,6 +510,12 @@ TYPE_RULES = {
 - Follow Short Answer rules exactly for short items.
 - Return ONLY a valid JSON array.""",
 
+    "vsa": """Very Short Answer (VSA) rules (follow strictly):
+- Questions must be direct and factual: What is, Define, Name, State, Who, When, Which.
+- Answer must be exactly 1-2 complete sentences, 20-40 words maximum. No elaboration.
+- Include 2-3 keywords an examiner would look for.
+- Return ONLY a valid JSON array.""",
+
     "cbq": """Case-Based Question (CBQ) rules (follow strictly):
 - Each CBQ must have: a passage of 60–100 words based on a real-world application, current affairs hook, or scenario derived from the chapter content.
 - 3 sub-questions progressing in difficulty: first easy (direct recall from passage), second medium (requires understanding), third hard (requires analysis or application beyond the passage).
@@ -512,7 +523,7 @@ TYPE_RULES = {
 - Return ONLY a valid JSON array.""",
 }
 
-MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192, "cbq": 8192}
+MAX_TOKENS_FOR_TYPE = {"mcq": 8192, "short": 8192, "long": 8192, "conceptual": 8192, "mixed": 8192, "cbq": 8192, "vsa": 8192}
 
 def _strip_markdown_code_fence(text):
     t = text.strip()
@@ -631,7 +642,7 @@ async def get_metadata():
 async def generate_from_pdf(
     file: UploadFile = File(...),
     difficulty: Literal["easy", "medium", "hard", "mixed"] = Form(...),
-    q_type: Literal["mcq", "short", "long", "conceptual", "mixed", "cbq"] = Form(...),
+    q_type: Literal["mcq", "short", "long", "conceptual", "mixed", "cbq", "vsa"] = Form(...),
     num_q: int = Form(...),
     subject: str = Form("general"),
     exam: str = Form("general"),
