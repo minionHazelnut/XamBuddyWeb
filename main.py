@@ -47,6 +47,19 @@ def _sb_get(table, params=None):
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
 
+def _sb_patch(table, id_val, data):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{id_val}"
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(url, data=body, headers=_sb_headers(), method="PATCH")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
+def _sb_delete(table, id_val):
+    url = f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{id_val}"
+    req = urllib.request.Request(url, headers=_sb_headers(), method="DELETE")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        resp.read()
+
 def _sb_post(table, data):
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     body = json.dumps(data).encode()
@@ -1034,6 +1047,27 @@ async def get_reference_uploads(
         return {"success": True, "count": len(rows), "uploads": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/api/questions/{question_id}")
+async def edit_question(question_id: str, request: Request):
+    body = await request.json()
+    allowed = {"question_text", "correct_answer", "explanation", "difficulty", "question_type"}
+    update = {k: v for k, v in body.items() if k in allowed}
+    if not update:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    try:
+        _sb_patch("questions", question_id, update)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True}
+
+@app.delete("/api/questions/{question_id}")
+async def delete_question(question_id: str):
+    try:
+        _sb_delete("questions", question_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True}
 
 @app.get("/api/errors")
 async def get_errors(limit: int = Query(50)):

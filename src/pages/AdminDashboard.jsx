@@ -8,6 +8,7 @@ import ExamPaperUploads from './ExamPaperUploads'
 import ExamPaperRetrieve from './ExamPaperRetrieve'
 import RetrieveChapterPdfs from './RetrieveChapterPdfs'
 import ReferenceUploads from './ReferenceUploads'
+import ErrorLog from './ErrorLog'
 
 export default function AdminDashboard() {
   const navigate = useNavigate()
@@ -39,6 +40,7 @@ export default function AdminDashboard() {
     { id: 'exam-retrieve', label: 'Exam Paper Retrieve', icon: '\u{1F50D}' },
     { id: 'chapter-retrieve', label: 'Retrieve Chapter PDFs', icon: '\u{1F4DA}' },
     { id: 'reference-uploads', label: 'Reference Uploads', icon: '\u{1F4D6}' },
+    { id: 'error-log', label: 'Error Log', icon: '\u26A0' },
   ]
 
   return (
@@ -85,6 +87,7 @@ export default function AdminDashboard() {
         {activeTab === 'exam-retrieve' && <ExamPaperRetrieve showStatus={showStatus} />}
         {activeTab === 'chapter-retrieve' && <RetrieveChapterPdfs showStatus={showStatus} />}
         {activeTab === 'reference-uploads' && <ReferenceUploads showStatus={showStatus} />}
+        {activeTab === 'error-log' && <ErrorLog showStatus={showStatus} />}
       </main>
     </div>
   )

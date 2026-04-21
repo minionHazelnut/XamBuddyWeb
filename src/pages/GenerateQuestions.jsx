@@ -29,8 +29,37 @@ export default function GenerateQuestions({ showStatus }) {
   const [newQuestions, setNewQuestions] = useState([])
   const [existingCount, setExistingCount] = useState(0)
   const [loadingExisting, setLoadingExisting] = useState(false)
+  const [chapterHistory, setChapterHistory] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
 
   const chapters = getChapters(exam, subject)
+
+  useEffect(() => { fetchChapterHistory() }, [])
+
+  async function fetchChapterHistory() {
+    setHistoryLoading(true)
+    try {
+      const [statsRes, metaRes] = await Promise.all([
+        fetch(`${API_BASE}/api/stats`),
+        supabase.from('chapter_meta').select('subject, exam, chapter, practical_pct, theory_pct'),
+      ])
+      const statsData = await statsRes.json()
+      const metaData = metaRes.data || []
+      const grouped = {}
+      for (const row of (statsData.stats || [])) {
+        const key = `${row.exam}||${row.subject}||${row.chapter}`
+        if (!grouped[key]) grouped[key] = { exam: row.exam, subject: row.subject, chapter: row.chapter, total: 0, byType: {} }
+        grouped[key].total += row.count
+        grouped[key].byType[row.question_type] = (grouped[key].byType[row.question_type] || 0) + row.count
+      }
+      for (const meta of metaData) {
+        const key = `${meta.exam}||${meta.subject}||${meta.chapter}`
+        if (grouped[key]) { grouped[key].practical_pct = meta.practical_pct; grouped[key].theory_pct = meta.theory_pct }
+      }
+      setChapterHistory(Object.values(grouped).sort((a, b) => b.total - a.total))
+    } catch {}
+    setHistoryLoading(false)
+  }
 
   useEffect(() => {
     if (exam && subject && chapter) {
@@ -317,6 +346,44 @@ export default function GenerateQuestions({ showStatus }) {
           </div>
         </div>
       )}
+      <div style={{ marginTop: '32px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+          <h3>Chapter History</h3>
+          <button onClick={fetchChapterHistory} style={{ background: 'none', border: '1px solid #4a6e6a', color: '#4a6e6a', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px' }}>Refresh</button>
+        </div>
+        {historyLoading ? <p>Loading...</p> : chapterHistory.length === 0 ? (
+          <p style={{ color: '#6b8a80' }}>No chapters generated yet.</p>
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>
+            <thead>
+              <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
+                <th style={{ padding: '8px' }}>Exam</th>
+                <th style={{ padding: '8px' }}>Subject</th>
+                <th style={{ padding: '8px' }}>Chapter</th>
+                <th style={{ padding: '8px' }}>Total Qs</th>
+                <th style={{ padding: '8px' }}>By Type</th>
+                <th style={{ padding: '8px' }}>Practical / Theory</th>
+              </tr>
+            </thead>
+            <tbody>
+              {chapterHistory.map((row, i) => (
+                <tr key={i} style={{ borderBottom: '1px solid #e0e8e6' }}>
+                  <td style={{ padding: '8px' }}>{row.exam}</td>
+                  <td style={{ padding: '8px' }}>{row.subject}</td>
+                  <td style={{ padding: '8px' }}>{row.chapter}</td>
+                  <td style={{ padding: '8px', fontWeight: '600' }}>{row.total}</td>
+                  <td style={{ padding: '8px', fontSize: '12px', color: '#6b8a80' }}>
+                    {Object.entries(row.byType).map(([t, c]) => `${t}: ${c}`).join(' · ')}
+                  </td>
+                  <td style={{ padding: '8px', fontSize: '12px' }}>
+                    {row.practical_pct != null ? `${row.practical_pct}% / ${row.theory_pct}%` : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
     </div>
   )
 }
