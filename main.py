@@ -747,7 +747,49 @@ async def extract_paper(
     paper_id = source_paper_id or str(uuid.uuid4())
     full_text = truncate_text(text, 60000)
 
-    prompt = f"""You are an expert CBSE question paper analyser. Extract every single question from the question paper below. Do not miss any question.
+    existing_fingerprints = _get_existing_exam_question_fingerprints(subject, class_level, board)
+    has_existing = len(existing_fingerprints) > 0
+
+    if has_existing:
+        prompt = f"""You are an expert CBSE question paper analyser. Questions for this subject already exist in the database. Your job is to extract the CONCEPTS tested in this paper and generate NEW questions that test the same concepts but using different wording, different scenarios, different numbers, or a different angle. Do not copy question text verbatim — rephrase everything so students see fresh questions on the same topics.
+
+MULTI-LINE QUESTION RULE: Many questions span multiple lines or have sub-parts. Treat the entire question — including all its lines, clauses, and sub-parts — as a single question_text. Never split one question across multiple entries.
+
+PAPER DETAILS:
+Subject: {subject}
+Class: {class_level}
+Board: {board}
+Year: {year}
+Exam Type: {exam_type}
+
+QUESTION TYPE DETECTION RULES (follow strictly):
+- MCQ: has four options labelled A B C D or 1 2 3 4
+- VSA (Very Short Answer): carries 2 marks
+- SA (Short Answer): carries 3 marks
+- LA (Long Answer): carries 5 marks
+- CBQ (Case Based Question): has a passage followed by sub-questions, carries 4 marks total
+
+DIFFICULTY TAGGING RULES:
+- easy: factual recall, definition-based, direct questions
+- medium: application-based, requires some understanding
+- hard: conceptual, why/how/which, multi-step reasoning, analytical
+
+For each question generate:
+- question_number: the number as it appears in the paper
+- question_text: your REPHRASED version testing the same concept
+- question_type: one of MCQ, VSA, SA, LA, CBQ
+- marks: integer marks for this question
+- options: for MCQs only, object with keys A B C D — null for all other types
+- chapter: the chapter name if identifiable from context, otherwise null
+- difficulty_level: easy, medium, or hard
+
+OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
+[{{"question_number":"1","question_text":"rephrased question text","question_type":"MCQ","marks":1,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}}]
+
+QUESTION PAPER:
+{full_text}"""
+    else:
+        prompt = f"""You are an expert CBSE question paper analyser. Extract every single question from the question paper below. Do not miss any question.
 
 MULTI-LINE QUESTION RULE: Many questions span multiple lines or have sub-parts. Treat the entire question — including all its lines, clauses, and sub-parts — as a single question_text. Never split one question across multiple entries just because it has line breaks.
 
