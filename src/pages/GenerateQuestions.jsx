@@ -37,12 +37,18 @@ export default function GenerateQuestions({ showStatus }) {
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
 
+  const DEFAULT_EXAMS = ['10th CBSE Board', '12th CBSE Board']
+
   useEffect(() => {
     fetchChapterHistory()
     fetch(`${API_BASE}/api/meta/options`)
       .then(r => r.json())
-      .then(data => setAvailableExams(data.exams || []))
-      .catch(() => {})
+      .then(data => {
+        const db = data.exams || []
+        const merged = [...new Set([...DEFAULT_EXAMS, ...db])].sort()
+        setAvailableExams(merged)
+      })
+      .catch(() => setAvailableExams(DEFAULT_EXAMS))
   }, [])
 
   useEffect(() => {

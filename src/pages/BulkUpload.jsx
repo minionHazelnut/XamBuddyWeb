@@ -50,11 +50,17 @@ export default function BulkUpload({ showStatus }) {
   const [progress, setProgress] = useState(null)
   const [results, setResults] = useState([])
 
+  const DEFAULT_EXAMS = ['10th CBSE Board', '12th CBSE Board']
+
   useEffect(() => {
     fetch(`${API_BASE}/api/meta/options`)
       .then(r => r.json())
-      .then(data => setAvailableExams(data.exams || []))
-      .catch(() => {})
+      .then(data => {
+        const db = data.exams || []
+        const merged = [...new Set([...DEFAULT_EXAMS, ...db])].sort()
+        setAvailableExams(merged)
+      })
+      .catch(() => setAvailableExams(DEFAULT_EXAMS))
   }, [])
 
   function handleFolderChange(e) {
