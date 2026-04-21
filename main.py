@@ -174,7 +174,7 @@ def _save_exam_questions(questions, subject, class_level, board, year, exam_type
         if not qtext or len(qtext) < 5:
             continue
         norm = _exact_question_fingerprint(qtext)
-        if norm in existing:
+        if norm in existing or _too_similar_to_existing(norm, existing):
             skipped += 1
             continue
         q_type_raw = (q.get("question_type") or "").upper()
