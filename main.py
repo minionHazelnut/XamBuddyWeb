@@ -655,16 +655,6 @@ def _parse_ai_questions_json(raw, stop_reason):
 
 # ---------- Split-PDF helpers ----------
 
-_SPLIT_CHAPTER_PREFIX = re.compile(
-    r'^(chapter|ch\.?|unit|section|part)\s*[\d\w]+\.?\s*',
-    re.IGNORECASE,
-)
-
-def _split_clean_title(raw: str) -> str:
-    cleaned = _SPLIT_CHAPTER_PREFIX.sub('', raw).strip()
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-    return cleaned if cleaned else raw.strip()
-
 def _split_extract_subject_name(filename: str) -> str:
     from pathlib import Path as _Path
     stem = _Path(filename).stem
@@ -675,78 +665,86 @@ def _split_extract_subject_name(filename: str) -> str:
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned
 
-def _split_detect_body_font_size(doc) -> float:
-    size_weight: Counter = Counter()
-    sample = min(len(doc), 30)
-    for page_idx in range(sample):
-        for block in doc[page_idx].get_text("dict")["blocks"]:
-            if block["type"] != 0:
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    chars = len(span["text"].strip())
-                    if chars > 0:
-                        size_weight[round(span["size"], 1)] += chars
-    if not size_weight:
-        return 12.0
-    return size_weight.most_common(1)[0][0]
-
-def _split_page_chapter_title(page, body_size: float, threshold_multiplier: float) -> Optional[str]:
-    top_half_y = page.rect.height * 0.5
-    min_size = body_size * threshold_multiplier
-    bold_min_size = body_size * 1.1
-    title_parts = []
-    found_prominent = False
-    blocks = sorted(
-        page.get_text("dict")["blocks"],
-        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],
-    )
-    for block in blocks:
-        if block["type"] != 0:
-            continue
-        if block.get("bbox", [0, 0, 0, 0])[1] > top_half_y:
-            break
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                text = span["text"].strip()
-                if not text:
-                    continue
-                size = span["size"]
-                is_bold = bool(span["flags"] & 16)
-                if size >= min_size or (is_bold and size >= bold_min_size):
-                    title_parts.append(text)
-                    found_prominent = True
-    if not found_prominent or not title_parts:
-        return None
-    raw = " ".join(title_parts).strip()
-    if len(raw) < 2:
-        return None
-    return _split_clean_title(raw)
-
-def _split_find_chapters(doc, body_size: float, threshold_multiplier: float) -> list:
-    raw_hits = []
-    for page_idx in range(len(doc)):
-        title = _split_page_chapter_title(doc[page_idx], body_size, threshold_multiplier)
-        if title:
-            raw_hits.append((page_idx, title))
-    # Discard watermarks: text starting with @ or appearing on 3+ pages
-    title_counts: Counter = Counter(t for _, t in raw_hits)
-    raw_hits = [
-        (p, t) for p, t in raw_hits
-        if title_counts[t] < 3 and not t.startswith('@')
-    ]
-    merged = []
-    for page_idx, title in raw_hits:
-        if merged and page_idx - merged[-1][0] <= 1:
-            prev_idx, prev_title = merged[-1]
-            combined = (prev_title + " " + title).strip() if prev_title not in title else prev_title
-            merged[-1] = (prev_idx, combined)
-        else:
-            merged.append((page_idx, title))
-    return merged
-
 def _split_safe_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|\n\r\t]+', '', name).strip()
+
+def _split_page_text_by_lines(page) -> str:
+    """
+    Reconstruct page text line-by-line from word positions.
+    Standard get_text() loses column alignment on TOC pages; this groups
+    words sharing the same y-coordinate so each TOC row stays on one line.
+    """
+    words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_no)
+    if not words:
+        return ""
+    from collections import defaultdict
+    lines: dict = defaultdict(list)
+    for (x0, y0, x1, y1, word, *_) in words:
+        line_key = round(y0 / 4) * 4  # 4pt bucket — groups words on the same line
+        lines[line_key].append((x0, word))
+    result = []
+    for y_key in sorted(lines.keys()):
+        row = sorted(lines[y_key], key=lambda w: w[0])
+        result.append("  ".join(w for _, w in row))
+    return "\n".join(result)
+
+
+def _split_extract_toc_from_pdf(doc, claude_api_key: str) -> dict:
+    """
+    Send the first 35 pages to Claude to identify:
+      - contents_physical_page: 1-based physical page of the Contents/Index page
+      - chapters: [{title, printed_page}] — one entry per chapter, verbatim from Contents
+
+    The rule: page immediately after the Contents page = book page 1.
+    So for any chapter with printed_page N:
+      fitz_index (0-based) = contents_physical_page + N - 1
+    """
+    pages_text = []
+    sample = min(len(doc), 35)
+    for i in range(sample):
+        text = _split_page_text_by_lines(doc[i]).strip()
+        if text:
+            pages_text.append(f"=== Physical page {i + 1} ===\n{text[:2500]}")
+    combined = "\n\n".join(pages_text)
+
+    prompt = f"""You are analysing a textbook PDF. Text from the first {sample} physical pages is below.
+"Physical page" = 1-based position in the PDF file.
+
+TASK:
+1. Find the Contents / Index page — the page that lists ALL chapter names with their starting page numbers.
+2. Note its physical page number (e.g. if it says "=== Physical page 5 ===" above it, that is 5).
+3. Extract ONE entry per chapter — title verbatim from Contents, and the printed page number on that line.
+   Include Answers / Solutions / Answer Key if listed.
+
+Return ONLY valid JSON:
+{{
+  "contents_physical_page": <int>,
+  "chapters": [
+    {{"title": "exact title from contents", "printed_page": <int>}},
+    ...
+  ]
+}}
+
+Rules:
+- contents_physical_page: the physical page number of the Contents page itself.
+- One chapter object per line in the Contents — never group multiple chapters.
+- Copy titles exactly as written. Do not include the Contents page, title page, or foreword as chapters.
+- If no Contents page found: {{"error": "No contents page found"}}
+
+PDF TEXT:
+{combined}"""
+
+    client = anthropic.Anthropic(api_key=claude_api_key)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    start, end = raw.find("{"), raw.rfind("}") + 1
+    if start == -1 or end <= start:
+        raise ValueError(f"Claude returned non-JSON: {raw[:300]}")
+    return json.loads(raw[start:end])
 
 # ---------- API endpoints ----------
 
@@ -1533,69 +1531,84 @@ async def get_chapters(
 
 
 @app.post("/api/split-pdf/preview")
-async def split_pdf_preview(
-    file: UploadFile = File(...),
-    start_chapter: int = Form(1),
-    threshold: float = Form(1.4),
-):
+async def split_pdf_preview(file: UploadFile = File(...)):
     if not _FITZ_AVAILABLE:
         raise HTTPException(status_code=500, detail="PyMuPDF not installed. Run: pip install PyMuPDF")
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
     content = await file.read()
     try:
         doc = fitz.open(stream=content, filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
     total_pages = len(doc)
-    body_size = _split_detect_body_font_size(doc)
-    chapters = _split_find_chapters(doc, body_size, threshold)
+    try:
+        toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
+    except Exception as e:
+        doc.close()
+        raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
     doc.close()
+    if "error" in toc:
+        return JSONResponse(status_code=422, content={"error": toc["error"]})
+    chapters = toc.get("chapters", [])
     if not chapters:
-        return JSONResponse(status_code=422, content={
-            "error": "No chapters detected. Try lowering the threshold (e.g. 1.2) if headings are not much larger than body text."
-        })
+        return JSONResponse(status_code=422, content={"error": "No chapters found in table of contents."})
+    # contents_physical_page is 1-based.
+    # Rule: page immediately after Contents = book page 1.
+    # fitz 0-based index of book page N = contents_physical_page + N - 1
+    cp = toc.get("contents_physical_page", 1)
     result = []
-    for i, (page_idx, title) in enumerate(chapters):
-        end_page = chapters[i + 1][0] if i + 1 < len(chapters) else total_pages
+    for i, ch in enumerate(chapters):
+        fitz_start = cp + ch["printed_page"] - 1
+        fitz_end = (cp + chapters[i + 1]["printed_page"] - 2) if i + 1 < len(chapters) else total_pages - 1
         result.append({
-            "number": start_chapter + i,
-            "title": title,
-            "start_page": page_idx + 1,
-            "end_page": end_page,
-            "pages": end_page - page_idx,
+            "title": ch["title"],
+            "printed_page": ch["printed_page"],
+            "end_printed_page": chapters[i + 1]["printed_page"] - 1 if i + 1 < len(chapters) else total_pages - cp,
+            "pages": fitz_end - fitz_start + 1,
         })
     subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
-    return {"subject_name": subject_name, "body_size": round(body_size, 1), "total_pages": total_pages, "chapters": result}
+    return {"subject_name": subject_name, "total_pages": total_pages, "contents_physical_page": cp, "chapters": result}
 
 
 @app.post("/api/split-pdf/download")
-async def split_pdf_download(
-    file: UploadFile = File(...),
-    start_chapter: int = Form(1),
-    threshold: float = Form(1.4),
-):
+async def split_pdf_download(file: UploadFile = File(...)):
     if not _FITZ_AVAILABLE:
-        raise HTTPException(status_code=500, detail="PyMuPDF not installed. Run: pip install PyMuPDF")
+        raise HTTPException(status_code=500, detail="PyMuPDF not installed.")
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
     content = await file.read()
     try:
         doc = fitz.open(stream=content, filetype="pdf")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
     total_pages = len(doc)
-    body_size = _split_detect_body_font_size(doc)
-    chapters = _split_find_chapters(doc, body_size, threshold)
+    try:
+        toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
+    except Exception as e:
+        doc.close()
+        raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
+    if "error" in toc:
+        doc.close()
+        raise HTTPException(status_code=422, detail=toc["error"])
+    chapters = toc.get("chapters", [])
     if not chapters:
         doc.close()
-        raise HTTPException(status_code=422, detail="No chapters detected. Try a lower threshold.")
+        raise HTTPException(status_code=422, detail="No chapters found in table of contents.")
+    # contents_physical_page is 1-based.
+    # Rule: page immediately after Contents = book page 1.
+    # fitz 0-based index of book page N = contents_physical_page + N - 1
+    cp = toc.get("contents_physical_page", 1)
     subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, (start_page, title) in enumerate(chapters):
-            end_page = chapters[i + 1][0] if i + 1 < len(chapters) else total_pages
-            chapter_num = start_chapter + i
-            pdf_filename = f"{chapter_num}. {_split_safe_filename(title)}.pdf"
+        for i, ch in enumerate(chapters):
+            fitz_start = cp + ch["printed_page"] - 1
+            fitz_end = (cp + chapters[i + 1]["printed_page"] - 2) if i + 1 < len(chapters) else total_pages - 1
+            pdf_filename = f"{_split_safe_filename(ch['title'])}.pdf"
             zip_entry = f"{subject_name}/{pdf_filename}"
             chapter_doc = fitz.open()
-            chapter_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+            chapter_doc.insert_pdf(doc, from_page=fitz_start, to_page=fitz_end)
             pdf_bytes = chapter_doc.tobytes(deflate=True)
             chapter_doc.close()
             zf.writestr(zip_entry, pdf_bytes)

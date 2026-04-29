@@ -66,7 +66,7 @@
 - Re-use stored chapter PDF from Supabase Storage for re-generation (no re-upload needed)
 - Chapter history table: shows all chapters with generation stats
 - Chapter mismatch check: validates chapter name against PDF content before generating; logs error and aborts if mismatch
-- **PDF Splitter tool** (BulkUpload.jsx + `scripts/split_pdf.py`): upload a full textbook PDF, auto-detect chapter boundaries via PyMuPDF font-size analysis, preview detected chapters, download a ZIP of per-chapter PDFs ready for bulk upload; supports `--start-chapter` for Part 2 PDFs; filters watermarks (repeating text and `@`-prefixed headers like KTBS)
+- **PDF Splitter tool** (BulkUpload.jsx + `/api/split-pdf/preview` + `/api/split-pdf/download`): upload a full textbook PDF → Claude reads the Contents/Index page and extracts chapter titles + printed page numbers verbatim → page immediately after the Contents page is treated as book page 1 (all earlier pages are ignored) → each chapter split exactly by printed page range → Answers/Solutions section split as a separate PDF → packaged as a ZIP ready for bulk upload
 
 ### Not Done
 - Rename/migrate `questions` table to `generated_questions` (still `questions`)
