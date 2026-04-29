@@ -3,10 +3,10 @@ import { supabase } from '../lib/supabase'
 import { CHAPTERS_BY_EXAM_SUBJECT } from '../lib/chapters'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-const SUBJECTS = [
-  'Biology', 'Chemistry', 'Computer Science', 'Economics', 'English',
+const DEFAULT_SUBJECTS = [
+  'Biology', 'Chemistry', 'Civics', 'Computer Science', 'Economics', 'English',
   'Geography', 'Hindi', 'History', 'Mathematics', 'Physics',
-  'Political Science', 'Psychology',
+  'Political Science', 'Psychology', 'Science', 'Social Science',
 ]
 
 function getChapters(exam, subject) {
@@ -36,6 +36,7 @@ export default function GenerateQuestions({ showStatus }) {
 
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
+  const [availableSubjects, setAvailableSubjects] = useState(DEFAULT_SUBJECTS)
 
   const DEFAULT_EXAMS = ['10th CBSE Board', '12th CBSE Board']
 
@@ -44,9 +45,11 @@ export default function GenerateQuestions({ showStatus }) {
     fetch(`${API_BASE}/api/meta/options`)
       .then(r => r.json())
       .then(data => {
-        const db = data.exams || []
-        const merged = [...new Set([...DEFAULT_EXAMS, ...db])].sort()
+        const dbExams = data.exams || []
+        const merged = [...new Set([...DEFAULT_EXAMS, ...dbExams])].sort()
         setAvailableExams(merged)
+        const dbSubjects = data.subjects || []
+        setAvailableSubjects([...new Set([...DEFAULT_SUBJECTS, ...dbSubjects])].sort())
       })
       .catch(() => setAvailableExams(DEFAULT_EXAMS))
   }, [])
@@ -338,19 +341,32 @@ export default function GenerateQuestions({ showStatus }) {
           </div>
           <div className="form-group">
             <label>Subject:</label>
-            <select value={subject} onChange={(e) => { setSubject(e.target.value); setChapter('') }}>
-              <option value="">Select Subject</option>
-              {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
-            </select>
+            <input
+              list="subject-suggestions"
+              value={subject}
+              onChange={(e) => { setSubject(e.target.value); setChapter('') }}
+              placeholder="Type or select subject"
+              style={{ width: '100%', padding: '10px 12px', border: '2px solid #d5e8e0', borderRadius: '10px', fontSize: '14px', background: '#f8fcfa', boxSizing: 'border-box' }}
+            />
+            <datalist id="subject-suggestions">
+              {availableSubjects.map(s => <option key={s} value={s} />)}
+            </datalist>
           </div>
         </div>
 
         <div className="form-group">
-          <label>Chapter:</label>
-          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0 || loadingChapters}>
-            <option value="">{loadingChapters ? 'Loading chapters...' : chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
-            {chapters.map(ch => <option key={ch} value={ch}>{ch}</option>)}
-          </select>
+          <label>Chapter: <span style={{ fontWeight: 400, color: '#6b8a80', fontSize: '12px' }}>(select from list or type a new name)</span></label>
+          <input
+            list="chapter-suggestions"
+            value={chapter}
+            onChange={(e) => setChapter(e.target.value)}
+            placeholder={loadingChapters ? 'Loading suggestions...' : !exam || !subject ? 'Select exam & subject first' : 'Type or select chapter name'}
+            disabled={!exam || !subject}
+            style={{ width: '100%', padding: '10px 12px', border: '2px solid #d5e8e0', borderRadius: '10px', fontSize: '14px', background: '#f8fcfa', boxSizing: 'border-box' }}
+          />
+          <datalist id="chapter-suggestions">
+            {chapters.map(ch => <option key={ch} value={ch} />)}
+          </datalist>
         </div>
 
         <div className="form-row">

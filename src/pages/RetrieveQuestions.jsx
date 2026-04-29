@@ -26,23 +26,36 @@ export default function RetrieveQuestions({ showStatus }) {
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(null)
 
-  const [availableExams, setAvailableExams] = useState([])
-  const [availableSubjects, setAvailableSubjects] = useState([])
+  const DEFAULT_EXAMS = ['6th CBSE Board', '10th CBSE Board', '12th CBSE Board']
+  const DEFAULT_SUBJECTS = [
+    'Biology', 'Chemistry', 'Civics', 'Computer Science', 'Economics', 'English',
+    'Geography', 'Hindi', 'History', 'Mathematics', 'Physics',
+    'Political Science', 'Psychology', 'Science', 'Social Science',
+  ]
+
+  const [availableExams, setAvailableExams] = useState(DEFAULT_EXAMS)
+  const [availableSubjects, setAvailableSubjects] = useState(DEFAULT_SUBJECTS)
   const [chapters, setChapters] = useState([])
   const [loadingChapters, setLoadingChapters] = useState(false)
 
   useEffect(() => {
     fetch(`${API_BASE}/api/meta/options`)
       .then(r => r.json())
-      .then(data => { setAvailableExams(data.exams || []) })
+      .then(data => {
+        const db = data.exams || []
+        setAvailableExams([...new Set([...DEFAULT_EXAMS, ...db])].sort())
+      })
       .catch(() => {})
   }, [])
 
   useEffect(() => {
-    if (!exam) { setAvailableSubjects([]); return }
+    if (!exam) { setAvailableSubjects(DEFAULT_SUBJECTS); return }
     fetch(`${API_BASE}/api/meta/options?exam=${encodeURIComponent(exam)}`)
       .then(r => r.json())
-      .then(data => { setAvailableSubjects(data.subjects || []) })
+      .then(data => {
+        const db = data.subjects || []
+        setAvailableSubjects([...new Set([...DEFAULT_SUBJECTS, ...db])].sort())
+      })
       .catch(() => {})
   }, [exam])
 
@@ -146,10 +159,17 @@ export default function RetrieveQuestions({ showStatus }) {
 
         <div className="form-group">
           <label>Chapter:</label>
-          <select value={chapter} onChange={(e) => setChapter(e.target.value)} disabled={chapters.length === 0 || loadingChapters}>
-            <option value="">{loadingChapters ? 'Loading chapters...' : chapters.length === 0 ? 'Select exam & subject first' : 'Select Chapter'}</option>
-            {chapters.map(ch => <option key={ch} value={ch}>{ch}</option>)}
-          </select>
+          <input
+            list="retrieve-chapter-suggestions"
+            value={chapter}
+            onChange={e => setChapter(e.target.value)}
+            placeholder={loadingChapters ? 'Loading...' : !exam || !subject ? 'Select exam & subject first' : 'Type or select chapter'}
+            disabled={!exam || !subject}
+            style={{ width: '100%', padding: '10px 12px', border: '2px solid #d5e8e0', borderRadius: '10px', fontSize: '14px', background: '#f8fcfa', boxSizing: 'border-box' }}
+          />
+          <datalist id="retrieve-chapter-suggestions">
+            {chapters.map(ch => <option key={ch} value={ch} />)}
+          </datalist>
         </div>
 
         <div className="form-row">
@@ -158,6 +178,7 @@ export default function RetrieveQuestions({ showStatus }) {
             <select value={qType} onChange={(e) => setQType(e.target.value)}>
               <option value="">All Types</option>
               <option value="mcq">MCQ</option>
+              <option value="ar">Assertion & Reason</option>
               <option value="short">Short Answer</option>
               <option value="long">Long Answer</option>
               <option value="conceptual">Conceptual</option>
@@ -238,7 +259,17 @@ export default function RetrieveQuestions({ showStatus }) {
                   <p style={{ fontWeight: '500', marginBottom: '6px' }}>Q{i + 1}. {q.question}</p>
                   {q.options && typeof q.options === 'object' && (
                     <div style={{ fontSize: '14px', color: '#555', margin: '4px 0 8px 0' }}>
-                      {Object.entries(q.options).map(([k, v]) => <div key={k}><strong>{k}.</strong> {v}</div>)}
+                      {Array.isArray(q.options.sub_questions)
+                        ? q.options.sub_questions.map((sq, si) => (
+                            <div key={si} style={{ marginBottom: '6px', paddingLeft: '12px', borderLeft: '2px solid #d5e8e0' }}>
+                              <strong>({si + 1})</strong> {sq.question}
+                              {sq.answer && <div style={{ color: '#4a6e6a', marginTop: '2px' }}><em>Ans:</em> {sq.answer}</div>}
+                            </div>
+                          ))
+                        : Object.entries(q.options).map(([k, v]) => (
+                            typeof v === 'string' ? <div key={k}><strong>{k}.</strong> {v}</div> : null
+                          ))
+                      }
                     </div>
                   )}
                   {(q.answer || q.correct_answer) && (

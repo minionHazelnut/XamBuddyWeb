@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { supabase } from '../lib/supabase'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -15,6 +15,9 @@ function toTitleCase(text) {
   }).join(' ')
 }
 
+const GRADES = ['6th', '7th', '8th', '9th', '10th', '11th', '12th']
+const BOARDS = ['CBSE', 'ICSE', 'State']
+
 const BATCHES = [
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (1/2)' },
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (2/2)' },
@@ -24,14 +27,6 @@ const BATCHES = [
   { q_type: 'conceptual', num_q: 15, label: 'Conceptual' },
   { q_type: 'cbq',        num_q: 10, label: 'Case-Based Questions' },
 ]
-
-function parseExam(examStr) {
-  const gradeMatch = examStr.match(/^(\d+th|\d+st|\d+nd|\d+rd)/i)
-  const grade = gradeMatch ? gradeMatch[1] : ''
-  const boardMatch = examStr.match(/(CBSE|ICSE|State)/i)
-  const board = boardMatch ? boardMatch[1].toUpperCase() : ''
-  return { grade, board }
-}
 
 function parseFolderStructure(fileList) {
   const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'))
@@ -53,26 +48,42 @@ function parseFolderStructure(fileList) {
 }
 
 export default function BulkUpload({ showStatus }) {
-  const [exam, setExam] = useState('')
+  const [grade, setGrade] = useState('')
+  const [board, setBoard] = useState('CBSE')
   const [structure, setStructure] = useState({})
   const [chapters, setChapters] = useState([])
   const [extracting, setExtracting] = useState(false)
-  const [availableExams, setAvailableExams] = useState([])
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [results, setResults] = useState([])
+  const [wakeLockActive, setWakeLockActive] = useState(false)
 
-  const DEFAULT_EXAMS = ['10th CBSE Board', '12th CBSE Board']
+  // Split PDF tool state
+  const [splitOpen, setSplitOpen] = useState(false)
+  const [splitFile, setSplitFile] = useState(null)
+  const [splitStartChapter, setSplitStartChapter] = useState(1)
+  const [splitThreshold, setSplitThreshold] = useState(1.4)
+  const [splitPreviewing, setSplitPreviewing] = useState(false)
+  const [splitDownloading, setSplitDownloading] = useState(false)
+  const [splitPreview, setSplitPreview] = useState(null)
+  const [splitError, setSplitError] = useState(null)
+
+  const wakeLockRef = useRef(null)
+  const processingRef = useRef(false)
+
+  const exam = grade && board ? `${grade} ${board} Board` : ''
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/meta/options`)
-      .then(r => r.json())
-      .then(data => {
-        const db = data.exams || []
-        const merged = [...new Set([...DEFAULT_EXAMS, ...db])].sort()
-        setAvailableExams(merged)
-      })
-      .catch(() => setAvailableExams(DEFAULT_EXAMS))
+    async function onVisibilityChange() {
+      if (document.visibilityState === 'visible' && processingRef.current && 'wakeLock' in navigator) {
+        try {
+          wakeLockRef.current = await navigator.wakeLock.request('screen')
+          setWakeLockActive(true)
+        } catch {}
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
   }, [])
 
   function handleFolderChange(e) {
@@ -80,6 +91,23 @@ export default function BulkUpload({ showStatus }) {
     setStructure(struct)
     setChapters([])
     setResults([])
+  }
+
+  function removeFileFromStructure(subject, fileName) {
+    setStructure(prev => {
+      const updated = { ...prev, [subject]: prev[subject].filter(f => f.name !== fileName) }
+      if (updated[subject].length === 0) {
+        const { [subject]: _, ...rest } = updated
+        return rest
+      }
+      return updated
+    })
+    setChapters([])
+    setResults([])
+  }
+
+  function removeChapter(idx) {
+    setChapters(prev => prev.filter((_, i) => i !== idx))
   }
 
   async function handleExtractTitles() {
@@ -120,10 +148,7 @@ export default function BulkUpload({ showStatus }) {
 
     allChapters.sort((a, b) => {
       if (a.subject !== b.subject) return a.subject.localeCompare(b.subject)
-      if (a.chapterNumber != null && b.chapterNumber != null) return a.chapterNumber - b.chapterNumber
-      if (a.chapterNumber != null) return -1
-      if (b.chapterNumber != null) return 1
-      return a.file.name.localeCompare(b.file.name, undefined, { numeric: true })
+      return a.file.name.localeCompare(b.file.name, undefined, { numeric: true, sensitivity: 'base' })
     })
 
     setChapters(allChapters)
@@ -137,7 +162,6 @@ export default function BulkUpload({ showStatus }) {
 
   async function uploadChapterPdf(file, subject, chapter) {
     try {
-      const { grade, board } = parseExam(exam)
       const { data: existing } = await supabase
         .from('pdf_uploads').select('id')
         .eq('board', board).eq('grade', grade).eq('subject', subject).eq('chapter', chapter)
@@ -154,7 +178,14 @@ export default function BulkUpload({ showStatus }) {
   async function handleProcessAll() {
     if (!exam) { showStatus('Select an exam', 'error'); return }
     if (chapters.length === 0) { showStatus('Extract chapter titles first', 'error'); return }
+    processingRef.current = true
     setProcessing(true)
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLockRef.current = await navigator.wakeLock.request('screen')
+        setWakeLockActive(true)
+      } catch {}
+    }
 
     // Target question counts per type (in DB, conceptual stores as 'long')
     const DB_TYPE = { mcq: 'mcq', vsa: 'vsa', short: 'short', long: 'long', conceptual: 'long', cbq: 'cbq' }
@@ -211,6 +242,7 @@ export default function BulkUpload({ showStatus }) {
         formData.append('difficulty', 'mixed')
         formData.append('num_q', adjustedNumQ)
         if (ch.chapterNumber != null) formData.append('chapter_order', ch.chapterNumber)
+        if (ch.edited) formData.append('title_edited', 'true')
 
         try {
           let res
@@ -225,7 +257,8 @@ export default function BulkUpload({ showStatus }) {
           }
 
           const result = await res.json()
-          if (result.questions) {
+          const errMsg = result.error || result.detail || null
+          if (Array.isArray(result.questions)) {
             const count = result.questions.length
             chResult.saved += count
             chResult.breakdown[batch.q_type] = (chResult.breakdown[batch.q_type] || 0) + count
@@ -234,11 +267,12 @@ export default function BulkUpload({ showStatus }) {
             chapterBreakdown[batch.q_type] = (chapterBreakdown[batch.q_type] || 0) + count
             existingCounts[typeKey] = alreadyHave + count
             setProgress(p => ({ ...p, savedTotal: grandTotal, chapterBreakdown: { ...chapterBreakdown }, grandBreakdown: { ...grandBreakdown } }))
-          } else if (result.error) {
-            chResult.errors.push(`${batch.label}: ${result.error}`)
+          } else if (errMsg || !res.ok) {
+            const displayErr = errMsg || `HTTP ${res.status}`
+            chResult.errors.push(`${batch.label}: ${displayErr}`)
             fetch(`${API_BASE}/api/log`, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Failed to generate ${batch.q_type} for "${ch.title}" (${ch.subject}): ${result.error}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type, num_q_requested: adjustedNumQ, num_q_generated: 0 } })
+              body: JSON.stringify({ endpoint: 'bulk-upload', stage: `batch_${batch.q_type}`, message: `Failed to generate ${batch.q_type} for "${ch.title}" (${ch.subject}): ${displayErr}`, context: { subject: ch.subject, chapter: ch.title, exam, q_type: batch.q_type, num_q_requested: adjustedNumQ, num_q_generated: 0 } })
             }).catch(() => {})
             if (res.status === 422) {
               fatalMismatch = true
@@ -275,9 +309,69 @@ export default function BulkUpload({ showStatus }) {
       ))
     }
 
+    if (wakeLockRef.current) {
+      try { await wakeLockRef.current.release() } catch {}
+      wakeLockRef.current = null
+    }
+    processingRef.current = false
+    setWakeLockActive(false)
     setProgress(null)
     setProcessing(false)
     showStatus(`Done — ${grandTotal} questions generated across ${chapters.length} chapters`, 'success')
+  }
+
+  async function handleSplitPreview() {
+    if (!splitFile) return
+    setSplitPreviewing(true)
+    setSplitPreview(null)
+    setSplitError(null)
+    try {
+      const fd = new FormData()
+      fd.append('file', splitFile)
+      fd.append('start_chapter', splitStartChapter)
+      fd.append('threshold', splitThreshold)
+      const res = await fetch(`${API_BASE}/api/split-pdf/preview`, { method: 'POST', body: fd })
+      const data = await res.json()
+      if (!res.ok || data.error) {
+        setSplitError(data.error || data.detail || `Error ${res.status}`)
+      } else {
+        setSplitPreview(data)
+      }
+    } catch (err) {
+      setSplitError(err.message)
+    } finally {
+      setSplitPreviewing(false)
+    }
+  }
+
+  async function handleSplitDownload() {
+    if (!splitFile) return
+    setSplitDownloading(true)
+    try {
+      const fd = new FormData()
+      fd.append('file', splitFile)
+      fd.append('start_chapter', splitStartChapter)
+      fd.append('threshold', splitThreshold)
+      const res = await fetch(`${API_BASE}/api/split-pdf/download`, { method: 'POST', body: fd })
+      if (!res.ok) {
+        const data = await res.json()
+        setSplitError(data.detail || `Error ${res.status}`)
+        return
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const disposition = res.headers.get('Content-Disposition') || ''
+      const match = disposition.match(/filename="([^"]+)"/)
+      a.download = match ? match[1] : 'chapters.zip'
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setSplitError(err.message)
+    } finally {
+      setSplitDownloading(false)
+    }
   }
 
   const subjectCount = Object.keys(structure).length
@@ -287,17 +381,23 @@ export default function BulkUpload({ showStatus }) {
     <div className="page-content">
       <h2>Bulk Chapter Upload</h2>
       <p style={{ color: '#6b8a80', fontSize: '14px', marginBottom: '24px' }}>
-        Upload your entire grade folder. Expected structure: <code>GradeFolder / Subject / chapter.pdf</code>
+        Upload a grade folder (<code>Grade / Subject / chapter.pdf</code>) or a subject folder directly (<code>Subject / chapter.pdf</code>). Both structures are supported.
       </p>
 
       {/* Step 1 */}
       <div className="form-panel" style={{ marginBottom: '16px' }}>
         <div className="form-row">
           <div className="form-group">
-            <label>Exam / Grade:</label>
-            <select value={exam} onChange={e => setExam(e.target.value)}>
-              <option value="">Select Exam</option>
-              {availableExams.map(ex => <option key={ex} value={ex}>{ex}</option>)}
+            <label>Grade:</label>
+            <select value={grade} onChange={e => { setGrade(e.target.value); setChapters([]); setResults([]) }}>
+              <option value="">Select Grade</option>
+              {GRADES.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Board:</label>
+            <select value={board} onChange={e => { setBoard(e.target.value); setChapters([]); setResults([]) }}>
+              {BOARDS.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
           </div>
           <div className="form-group">
@@ -316,10 +416,23 @@ export default function BulkUpload({ showStatus }) {
         </div>
 
         {subjectCount > 0 && (
-          <div style={{ marginTop: '12px', padding: '10px 14px', background: '#f0f4f3', borderRadius: '8px' }}>
+          <div style={{ marginTop: '12px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #d4e0de' }}>
             {Object.entries(structure).map(([subject, files]) => (
-              <div key={subject} style={{ fontSize: '13px', color: '#6b8a80', marginBottom: '4px' }}>
-                <strong style={{ color: '#2d4a47' }}>{subject}</strong> — {files.length} chapter{files.length !== 1 ? 's' : ''}
+              <div key={subject}>
+                <div style={{ padding: '5px 12px', background: '#e0ebe9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <strong style={{ fontSize: '13px', color: '#2d4a47' }}>{subject}</strong>
+                  <span style={{ fontSize: '12px', color: '#6b8a80' }}>{files.length} PDF{files.length !== 1 ? 's' : ''}</span>
+                </div>
+                {files.map(f => (
+                  <div key={f.name} style={{ display: 'flex', alignItems: 'center', padding: '3px 12px', borderBottom: '1px solid #edf2f1', fontSize: '13px', color: '#4a6e6a' }}>
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                    <button
+                      onClick={() => removeFileFromStructure(subject, f.name)}
+                      title="Remove from queue"
+                      style={{ background: 'none', border: 'none', color: '#bbb', cursor: 'pointer', fontSize: '17px', lineHeight: 1, padding: '0 4px', flexShrink: 0 }}
+                    >×</button>
+                  </div>
+                ))}
               </div>
             ))}
           </div>
@@ -355,6 +468,7 @@ export default function BulkUpload({ showStatus }) {
                 <th style={{ padding: '6px 8px' }}>Extracted Title (editable)</th>
                 <th style={{ padding: '6px 8px' }}>Confidence</th>
                 <th style={{ padding: '6px 8px' }}>Status</th>
+                <th style={{ padding: '6px 8px' }}></th>
               </tr>
             </thead>
             <tbody>
@@ -369,6 +483,14 @@ export default function BulkUpload({ showStatus }) {
                       onChange={e => setChapters(prev => prev.map((c, j) =>
                         j === i ? { ...c, title: e.target.value, edited: true } : c
                       ))}
+                      onBlur={e => {
+                        const formatted = toTitleCase(e.target.value)
+                        if (formatted !== e.target.value) {
+                          setChapters(prev => prev.map((c, j) =>
+                            j === i ? { ...c, title: formatted, edited: true } : c
+                          ))
+                        }
+                      }}
                       style={{ width: '100%', border: ch.edited ? '1px solid #4a6e6a' : '1px solid #e0e8e6', borderRadius: '4px', padding: '3px 6px', fontSize: '13px', background: ch.edited ? '#f0f9f7' : 'transparent' }}
                     />
                   </td>
@@ -387,6 +509,16 @@ export default function BulkUpload({ showStatus }) {
                       {ch.status}
                     </span>
                   </td>
+                  <td style={{ padding: '6px 4px', textAlign: 'center' }}>
+                    {ch.status === 'pending' && (
+                      <button
+                        onClick={() => removeChapter(i)}
+                        disabled={processing}
+                        title="Remove from queue"
+                        style={{ background: 'none', border: 'none', color: '#bbb', cursor: processing ? 'not-allowed' : 'pointer', fontSize: '17px', lineHeight: 1, padding: '0 4px' }}
+                      >×</button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -397,6 +529,12 @@ export default function BulkUpload({ showStatus }) {
       {/* Progress */}
       {processing && progress && (
         <div style={{ padding: '16px', background: '#f0f4f3', borderRadius: '10px', border: '1px solid #c8d8d5', marginBottom: '16px' }}>
+          {wakeLockActive && (
+            <div style={{ fontSize: '11px', color: '#6b8a80', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '5px' }}>
+              <span style={{ display: 'inline-block', width: '7px', height: '7px', borderRadius: '50%', background: '#4a6e6a' }} />
+              Screen kept awake — safe to leave this tab open
+            </div>
+          )}
           {/* Header */}
           <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
             <span style={{ fontWeight: '600', color: '#2d4a47', fontSize: '14px' }}>
@@ -491,6 +629,124 @@ export default function BulkUpload({ showStatus }) {
           </p>
         </div>
       )}
+      {/* Split PDF Tool */}
+      <div className="form-panel" style={{ marginTop: '16px' }}>
+        <div
+          style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer', userSelect: 'none' }}
+          onClick={() => setSplitOpen(o => !o)}
+        >
+          <h3 style={{ margin: 0, fontSize: '15px' }}>✂ Split Textbook PDF into Chapter ZIPs</h3>
+          <span style={{ color: '#6b8a80', fontSize: '16px' }}>{splitOpen ? '▲' : '▼'}</span>
+        </div>
+
+        {splitOpen && (
+          <div style={{ marginTop: '16px' }}>
+            <p style={{ color: '#6b8a80', fontSize: '13px', margin: '0 0 14px 0' }}>
+              Upload a full textbook PDF. The tool detects chapter headings by font size and splits it into per-chapter PDFs packaged as a ZIP — ready to upload above.
+            </p>
+
+            {/* Inputs */}
+            <div className="form-row" style={{ alignItems: 'flex-end', gap: '12px', flexWrap: 'wrap' }}>
+              <div className="form-group" style={{ flex: '2', minWidth: '200px' }}>
+                <label>Textbook PDF:</label>
+                <label
+                  className={`file-input-label ${splitFile ? 'has-file' : ''}`}
+                  htmlFor="splitPdfInput"
+                  style={{ cursor: 'pointer', display: 'block' }}
+                >
+                  {splitFile ? splitFile.name : 'Click to select PDF'}
+                </label>
+                <input
+                  type="file" id="splitPdfInput" accept=".pdf" style={{ display: 'none' }}
+                  onChange={e => { setSplitFile(e.target.files[0] || null); setSplitPreview(null); setSplitError(null) }}
+                />
+              </div>
+
+              <div className="form-group" style={{ flex: '0 0 130px' }}>
+                <label>Start chapter #:</label>
+                <input
+                  type="number" min="1" value={splitStartChapter}
+                  onChange={e => { setSplitStartChapter(parseInt(e.target.value) || 1); setSplitPreview(null) }}
+                  style={{ width: '100%' }}
+                />
+              </div>
+
+              <div className="form-group" style={{ flex: '0 0 160px' }}>
+                <label title="Increase if too many false positives; decrease if chapters are missed">
+                  Threshold (1.2–1.8):
+                </label>
+                <input
+                  type="number" min="1.0" max="2.0" step="0.1" value={splitThreshold}
+                  onChange={e => { setSplitThreshold(parseFloat(e.target.value) || 1.4); setSplitPreview(null) }}
+                  style={{ width: '100%' }}
+                />
+              </div>
+
+              <div className="form-group" style={{ flex: '0 0 auto' }}>
+                <label style={{ visibility: 'hidden' }}>.</label>
+                <button
+                  onClick={handleSplitPreview}
+                  disabled={!splitFile || splitPreviewing || splitDownloading}
+                  style={{ whiteSpace: 'nowrap' }}
+                >
+                  {splitPreviewing ? 'Detecting...' : 'Preview Chapters'}
+                </button>
+              </div>
+            </div>
+
+            {/* Error */}
+            {splitError && (
+              <div style={{ marginTop: '10px', padding: '10px 14px', background: '#fdecea', borderRadius: '8px', color: '#c0392b', fontSize: '13px' }}>
+                {splitError}
+              </div>
+            )}
+
+            {/* Preview table */}
+            {splitPreview && (
+              <div style={{ marginTop: '14px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div style={{ fontSize: '13px', color: '#4a6e6a' }}>
+                    <strong>{splitPreview.chapters.length} chapters</strong> detected &nbsp;·&nbsp;
+                    Subject folder: <code style={{ background: '#e8f0ee', padding: '1px 5px', borderRadius: '3px' }}>{splitPreview.subject_name}</code> &nbsp;·&nbsp;
+                    Body font: {splitPreview.body_size}pt &nbsp;·&nbsp; {splitPreview.total_pages} pages total
+                  </div>
+                  <button
+                    onClick={handleSplitDownload}
+                    disabled={splitDownloading}
+                    style={{ background: '#2d4a47', color: '#fff', border: 'none', borderRadius: '8px', padding: '8px 18px', cursor: 'pointer', fontWeight: '600', fontSize: '13px', whiteSpace: 'nowrap' }}
+                  >
+                    {splitDownloading ? 'Building ZIP...' : '⬇ Download ZIP'}
+                  </button>
+                </div>
+
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
+                      <th style={{ padding: '5px 8px' }}>#</th>
+                      <th style={{ padding: '5px 8px' }}>Detected Title</th>
+                      <th style={{ padding: '5px 8px' }}>Pages</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {splitPreview.chapters.map(ch => (
+                      <tr key={ch.number} style={{ borderBottom: '1px solid #e0e8e6' }}>
+                        <td style={{ padding: '5px 8px', color: '#6b8a80', fontWeight: '600' }}>{ch.number}</td>
+                        <td style={{ padding: '5px 8px' }}>{ch.title}</td>
+                        <td style={{ padding: '5px 8px', color: '#6b8a80' }}>{ch.start_page}–{ch.end_page} ({ch.pages} pg)</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+
+                <p style={{ marginTop: '10px', fontSize: '12px', color: '#6b8a80' }}>
+                  If chapters look wrong, adjust the threshold and click Preview again.
+                  The ZIP folder will be named <strong>{splitPreview.subject_name}</strong> — use that exact name as the subject folder when uploading above.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

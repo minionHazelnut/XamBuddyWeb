@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { supabase } from '../lib/supabase'
+
+const API_BASE = import.meta.env.VITE_API_URL || ''
 
 export default function Dashboard() {
   const [stats, setStats] = useState([])
@@ -12,27 +13,9 @@ export default function Dashboard() {
 
   async function fetchStats() {
     try {
-      // Query Supabase directly — much faster than going through the Python serverless API
-      const { data, error } = await supabase
-        .from('questions')
-        .select('exam, subject, chapter, question_type')
-
-      if (error) {
-        console.error('Supabase error:', error)
-        return
-      }
-
-      // Group client-side
-      const groups = {}
-      for (const row of data) {
-        const key = `${row.exam}|${row.subject}|${row.chapter}|${row.question_type}`
-        if (!groups[key]) {
-          groups[key] = { exam: row.exam, subject: row.subject, chapter: row.chapter, question_type: row.question_type, count: 0 }
-        }
-        groups[key].count++
-      }
-
-      setStats(Object.values(groups))
+      const res = await fetch(`${API_BASE}/api/stats`)
+      const data = await res.json()
+      setStats(data.stats || [])
     } catch (err) {
       console.error('Failed to fetch stats:', err)
     } finally {
@@ -58,7 +41,12 @@ export default function Dashboard() {
     let filtered = stats
     for (const crumb of drillPath) {
       if (crumb.type === 'exam') filtered = filtered.filter(s => s.exam === crumb.value)
-      if (crumb.type === 'subject') filtered = filtered.filter(s => s.subject === crumb.value)
+      if (crumb.type === 'subject') {
+        const exam = drillPath.find(c => c.type === 'exam')?.value || ''
+        filtered = filtered.filter(s =>
+          resolveSubject(s.subject, exam) === crumb.value
+        )
+      }
     }
     return filtered
   }
@@ -77,13 +65,24 @@ export default function Dashboard() {
     setDrillPath(drillPath.slice(0, index))
   }
 
+  const SCIENCE_SUBJECTS = new Set(['Physics', 'Biology', 'Chemistry'])
+  function isJuniorExam(exam) {
+    return /^(6th|7th|8th|9th|10th)\b/i.test(exam)
+  }
+  function resolveSubject(subject, exam) {
+    if (SCIENCE_SUBJECTS.has(subject) && isJuniorExam(exam)) return 'Science'
+    return subject
+  }
+
   function renderCards() {
     const filtered = getFilteredStats()
     const level = getCurrentLevel()
+    const examContext = drillPath.find(c => c.type === 'exam')?.value || ''
 
     const groups = {}
     for (const row of filtered) {
-      const key = row[level]
+      const rawKey = row[level]
+      const key = level === 'subject' ? resolveSubject(rawKey, examContext || row.exam) : rawKey
       if (!groups[key]) groups[key] = { mcq: 0, short: 0, long: 0, total: 0 }
       groups[key][row.question_type] = (groups[key][row.question_type] || 0) + row.count
       groups[key].total += row.count

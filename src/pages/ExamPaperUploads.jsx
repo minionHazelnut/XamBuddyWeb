@@ -18,14 +18,78 @@ function detectYearFromName(name) {
   return m ? `20${m[1]}` : ''
 }
 
+const SET_RE = /(\d+)[-_\/](\d+)[-_\/](\d+)/g
+
+function detectSetNumberFromStart(name) {
+  const base = name.replace(/\.[^.]+$/, '')
+  const m = base.match(/^[^0-9]*(\d+)[-_\/](\d+)[-_\/](\d+)/)
+  return m ? `${m[1]}/${m[2]}/${m[3]}` : ''
+}
+
+function detectSetNumberFromEnd(name) {
+  const base = name.replace(/\.[^.]+$/, '')
+  const all = [...base.matchAll(SET_RE)]
+  if (all.length === 0) return ''
+  const last = all[all.length - 1]
+  return `${last[1]}/${last[2]}/${last[3]}`
+}
+
+function detectSetNumber(name) {
+  return detectSetNumberFromStart(name) || detectSetNumberFromEnd(name)
+}
+
+function buildPaperLabel(year, subjectCode, setNumber) {
+  const parts = [year, subjectCode].filter(Boolean)
+  if (setNumber) parts.push(setNumber)
+  return parts.join(' ')
+}
+
+const SUBJECT_PREFIX_MAP = {
+  acc: 'Accountancy', bio: 'Biology', bus: 'Business Studies',
+  che: 'Chemistry', eco: 'Economics', eng: 'English',
+  geo: 'Geography', his: 'History', mat: 'Mathematics',
+  phy: 'Physics', pol: 'Political Science', sci: 'Science',
+}
+
+function detectSubjectFromFolderName(name) {
+  const prefix = name.trim().slice(0, 3).toLowerCase()
+  return SUBJECT_PREFIX_MAP[prefix] || ''
+}
+
 function detectTypeFromName(name) {
   const lower = name.toLowerCase()
   if (/sample|mock|practice|test/.test(lower)) return 'sample_paper'
   return 'board_exam'
 }
 
+function extractSetNumberFromLabel(label) {
+  const m = (label || '').match(/(\d+\/\d+\/\d+)/)
+  return m ? m[1] : ''
+}
+
+function extractSubjectFromLabel(label) {
+  for (const s of SUBJECTS) {
+    if ((label || '').includes(s)) return s
+  }
+  return (label || '').replace(/^\d{4}\s+/, '').replace(/\s+\d+[\\/\-]\d+[\\/\-]\d+$/, '').trim() || label
+}
+
+
+function matchAnswerKeys(qpEntries, akFiles) {
+  // build map: setNumber -> akFile (set number read from END of AK filename)
+  const akBySet = {}
+  akFiles.forEach(f => {
+    const set = detectSetNumberFromEnd(f.name)
+    if (set) akBySet[set] = f
+  })
+  return qpEntries.map(qp => {
+    const set = qp.setNumber || detectSetNumberFromStart(qp.file.name)
+    return set && akBySet[set] ? akBySet[set] : null
+  })
+}
+
 function parsePaperFolder(fileList) {
-  const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'))
+  const files = Array.from(fileList).filter(f => /\.(pdf|txt)$/i.test(f.name))
   const entries = []
   for (const file of files) {
     const parts = file.webkitRelativePath.split('/')
@@ -35,6 +99,7 @@ function parsePaperFolder(fileList) {
       file,
       subject,
       year: detectYearFromName(file.name),
+      setNumber: detectSetNumber(file.name),
       paperType: detectTypeFromName(file.name),
       edited: false,
     })
@@ -65,6 +130,13 @@ export default function ExamPaperUploads({ showStatus }) {
   const [loadingQuestions, setLoadingQuestions] = useState(false)
   const [answerKeyForPaper, setAnswerKeyForPaper] = useState(null)
   const [matchingAnswerKey, setMatchingAnswerKey] = useState(false)
+  const [akSetNumber, setAkSetNumber] = useState('')
+
+  // — section-level answer key matching state —
+  const [checkedPaperIds, setCheckedPaperIds] = useState(new Set())
+  const [sectionAKFile, setSectionAKFile] = useState(null)
+  const [sectionAKMatching, setSectionAKMatching] = useState(false)
+  const [sectionAKResults, setSectionAKResults] = useState([])
 
   // — reference upload state —
   const [refBoard, setRefBoard] = useState('')
@@ -79,12 +151,20 @@ export default function ExamPaperUploads({ showStatus }) {
   // — bulk QP upload state —
   const [bulkBoard, setBulkBoard] = useState('')
   const [bulkGrade, setBulkGrade] = useState('')
+  const [bulkSubject, setBulkSubject] = useState('')
+  const [bulkYear, setBulkYear] = useState('')
   const [bulkPapers, setBulkPapers] = useState([])       // parsed entries
+  const [bulkAnswerFiles, setBulkAnswerFiles] = useState([])  // answer key File objects
   const [bulkProcessing, setBulkProcessing] = useState(false)
   const [bulkProgress, setBulkProgress] = useState(null)  // { idx, total, subject, file }
   const [bulkResults, setBulkResults] = useState([])      // [{subject, file, saved, skipped, error}]
 
   useEffect(() => { fetchPapers(); fetchRefUploads() }, [])
+
+  useEffect(() => {
+    if (!selectedPaper) return
+    setAkSetNumber(extractSetNumberFromLabel(selectedPaper.subject))
+  }, [selectedPaper?.source_paper_id])
 
   async function fetchPapers() {
     setLoadingPapers(true)
@@ -155,9 +235,10 @@ export default function ExamPaperUploads({ showStatus }) {
         formData.append('board', board)
         formData.append('year', year || '')
         formData.append('exam_type', examType)
+        formData.append('paper_pdf_url', examUrlData.publicUrl)
         const res = await fetch(`${API_BASE}/api/extract-paper`, { method: 'POST', body: formData })
         const result = await res.json()
-        if (result.error) throw new Error(result.error)
+        if (result.error || result.detail) throw new Error(result.error || result.detail)
         setExtractLog(['Done.', `Questions extracted: ${result.questions_extracted}`, `Saved: ${result.questions_saved}`, `Duplicates skipped: ${result.duplicates_skipped}`])
         fetchPapers()
       }
@@ -199,25 +280,64 @@ export default function ExamPaperUploads({ showStatus }) {
     }
   }
 
-  async function handleMatchAnswerKey(paperId) {
+  async function handleMatchAnswerKey() {
     if (!answerKeyForPaper) { showStatus('Please select an answer key PDF.', 'error'); return }
     setMatchingAnswerKey(true)
-    const formData = new FormData()
-    formData.append('file', answerKeyForPaper)
-    formData.append('source_paper_id', paperId)
     try {
+      const formData = new FormData()
+      formData.append('file', answerKeyForPaper)
+      formData.append('source_paper_id', selectedPaper.source_paper_id)
+      if (akSetNumber) formData.append('set_number', akSetNumber)
       const res = await fetch(`${API_BASE}/api/match-answer-key`, { method: 'POST', body: formData })
       const result = await res.json()
       if (result.error) throw new Error(result.error)
-      showStatus(`Matched ${result.answers_matched} answers. ${result.answers_failed} failed.`, 'success')
+      let msg = `Matched ${result.answers_matched} answers`
+      if (result.mismatched_rejected > 0) msg += `, ${result.mismatched_rejected} rejected (Q&A mismatch)`
+      if (result.answers_failed > 0) msg += `, ${result.answers_failed} unmatched`
+      showStatus(msg, 'success')
       setAnswerKeyForPaper(null)
       fetchPapers()
-      viewQuestions(paperId)
+      viewQuestions(selectedPaper.source_paper_id)
     } catch (err) {
       showStatus(`Matching failed: ${err.message}`, 'error')
     } finally {
       setMatchingAnswerKey(false)
     }
+  }
+
+  async function handleSectionMatchAK() {
+    if (!sectionAKFile) { showStatus('Please select an answer key file.', 'error'); return }
+    if (checkedPaperIds.size === 0) { showStatus('Select at least one paper.', 'error'); return }
+    setSectionAKMatching(true)
+    setSectionAKResults([])
+    const selected = papers.filter(p => checkedPaperIds.has(p.source_paper_id))
+    const results = []
+    let totalMatched = 0, totalRejected = 0
+    for (const paper of selected) {
+      const setNumber = extractSetNumberFromLabel(paper.subject)
+      const row = { subject: paper.subject, matched: 0, rejected: 0, error: null }
+      try {
+        const formData = new FormData()
+        formData.append('file', sectionAKFile)
+        formData.append('source_paper_id', paper.source_paper_id)
+        if (setNumber) formData.append('set_number', setNumber)
+        const res = await fetch(`${API_BASE}/api/match-answer-key`, { method: 'POST', body: formData })
+        const result = await res.json()
+        if (result.error) throw new Error(result.error)
+        row.matched = result.answers_matched || 0
+        row.rejected = result.mismatched_rejected || 0
+        totalMatched += row.matched
+        totalRejected += row.rejected
+      } catch (err) {
+        row.error = err.message
+      }
+      results.push(row)
+      setSectionAKResults([...results])
+    }
+    setSectionAKMatching(false)
+    fetchPapers()
+    const rejMsg = totalRejected > 0 ? `, ${totalRejected} rejected` : ''
+    showStatus(`Matched ${totalMatched} answers across ${selected.length} papers${rejMsg}.`, 'success')
   }
 
   async function viewQuestions(paperId) {
@@ -237,7 +357,23 @@ export default function ExamPaperUploads({ showStatus }) {
   function handleBulkFolderChange(e) {
     const files = e.target.files
     if (!files || files.length === 0) { setBulkPapers([]); return }
-    setBulkPapers(parsePaperFolder(files))
+    const folderName = files[0].webkitRelativePath.split('/')[0]
+    const detectedYear = detectYearFromName(folderName)
+    const detectedSubject = detectSubjectFromFolderName(folderName)
+    const yearToUse = detectedYear || bulkYear
+    const subjectToUse = bulkSubject || detectedSubject
+    if (detectedYear) setBulkYear(detectedYear)
+    if (!bulkSubject && detectedSubject) setBulkSubject(detectedSubject)
+    const base = parsePaperFolder(files).map(row => ({
+      ...row,
+      subject: subjectToUse || row.subject,
+      year: yearToUse || row.year,
+      setNumber: row.setNumber || detectSetNumber(row.file.name),
+      answerKeyFile: null,
+    }))
+    const matched = bulkAnswerFiles.length > 0 ? matchAnswerKeys(base, bulkAnswerFiles) : []
+    const parsed = base.map((r, i) => ({ ...r, answerKeyFile: matched[i] || null }))
+    setBulkPapers(parsed)
     setBulkResults([])
     setBulkProgress(null)
   }
@@ -246,8 +382,23 @@ export default function ExamPaperUploads({ showStatus }) {
     setBulkPapers(prev => prev.map((r, i) => i === idx ? { ...r, [field]: value, edited: true } : r))
   }
 
+  function removeBulkPaper(idx) {
+    setBulkPapers(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  function handleAnswerKeyFolderChange(e) {
+    const files = Array.from(e.target.files).filter(f => /\.(pdf|txt)$/i.test(f.name))
+    setBulkAnswerFiles(files)
+    if (bulkPapers.length > 0 && files.length > 0) {
+      const matched = matchAnswerKeys(bulkPapers, files)
+      setBulkPapers(prev => prev.map((r, i) => ({ ...r, answerKeyFile: matched[i] || null })))
+    }
+  }
+
   async function handleBulkProcess() {
     if (!bulkBoard || !bulkGrade) { showStatus('Select board and grade first.', 'error'); return }
+    if (!bulkSubject) { showStatus('Select a subject first.', 'error'); return }
+    if (!bulkYear) { showStatus('Enter a year first.', 'error'); return }
     if (bulkPapers.length === 0) { showStatus('No papers found in folder.', 'error'); return }
     setBulkProcessing(true)
     setBulkResults([])
@@ -260,20 +411,59 @@ export default function ExamPaperUploads({ showStatus }) {
       setBulkProgress({ idx: i + 1, total: bulkPapers.length, subject: entry.subject, file: entry.file.name })
       const row = { subject: entry.subject, file: entry.file.name, saved: 0, skipped: 0, extracted: 0, error: null }
       try {
+        // Read file bytes once — reuse for both storage upload and extraction
+        const fileBytes = await entry.file.arrayBuffer()
+        const fileBlob = new Blob([fileBytes], { type: 'application/pdf' })
+
+        // Upload PDF to storage
+        const fileName = `exam-papers/${Date.now()}_${entry.file.name}`
+        const { error: storageError } = await supabase.storage.from('pdf-uploads').upload(fileName, fileBlob)
+        if (storageError) throw storageError
+        const { data: urlData } = supabase.storage.from('pdf-uploads').getPublicUrl(fileName)
+
+        // Save to pdf_uploads
+        await supabase.from('pdf_uploads').insert({
+          board: bulkBoard,
+          grade: bulkGrade,
+          subject: entry.subject,
+          year: entry.year || null,
+          exam_type: entry.paperType === 'sample_paper' ? 'sample_paper' : 'board_exam',
+          exam_paper_pdf: urlData.publicUrl
+        })
+
+        const paperLabel = buildPaperLabel(entry.year, entry.subject, entry.setNumber)
         const formData = new FormData()
-        formData.append('file', entry.file)
-        formData.append('subject', entry.subject)
+        formData.append('file', new File([fileBytes], entry.file.name, { type: 'application/pdf' }))
+        formData.append('subject', paperLabel || entry.subject)
         formData.append('class_level', classLevel)
         formData.append('board', bulkBoard)
         formData.append('year', entry.year || '')
         formData.append('exam_type', entry.paperType)
+        formData.append('paper_pdf_url', urlData.publicUrl)
         const res = await fetch(`${API_BASE}/api/extract-paper`, { method: 'POST', body: formData })
         const result = await res.json()
-        if (result.error) throw new Error(result.error)
+        if (result.error || result.detail) throw new Error(result.error || result.detail)
         row.extracted = result.questions_extracted || 0
         row.saved = result.questions_saved || 0
         row.skipped = result.duplicates_skipped || 0
         totalSaved += row.saved
+
+        // Upload and match answer key if provided
+        if (entry.answerKeyFile && result.source_paper_id) {
+          const akBytes = await entry.answerKeyFile.arrayBuffer()
+          const akFileName = `answer-keys/${Date.now()}_${entry.answerKeyFile.name}`
+          const { error: akErr } = await supabase.storage.from('pdf-uploads').upload(akFileName, new Blob([akBytes], { type: 'application/pdf' }))
+          if (!akErr) {
+            const { data: akUrlData } = supabase.storage.from('pdf-uploads').getPublicUrl(akFileName)
+            await supabase.from('pdf_uploads').update({ answer_key_pdf: akUrlData.publicUrl }).eq('exam_paper_pdf', urlData.publicUrl)
+            const akForm = new FormData()
+            akForm.append('file', new File([akBytes], entry.answerKeyFile.name, { type: 'application/pdf' }))
+            akForm.append('source_paper_id', result.source_paper_id)
+            const akRes = await fetch(`${API_BASE}/api/match-answer-key`, { method: 'POST', body: akForm })
+            const akResult = await akRes.json()
+            row.answersMatched = akResult.answers_matched || 0
+          }
+        }
       } catch (err) {
         row.error = err.message
         await fetch(`${API_BASE}/api/log`, {
@@ -301,15 +491,21 @@ export default function ExamPaperUploads({ showStatus }) {
         <h2>{selectedPaper.subject} — {selectedPaper.board} Class {selectedPaper.class_level} {selectedPaper.year}</h2>
         <div className="form-panel" style={{ marginBottom: '20px' }}>
           <label><strong>Upload Answer Key for this paper</strong></label>
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginTop: '8px' }}>
-            <label className={`file-input-label ${answerKeyForPaper ? 'has-file' : ''}`} style={{ flex: 1 }}>
-              {answerKeyForPaper ? answerKeyForPaper.name : 'Click to select answer key PDF'}
-              <input type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => setAnswerKeyForPaper(e.target.files[0] || null)} />
+          <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginTop: '8px', flexWrap: 'wrap' }}>
+            <label className={`file-input-label ${answerKeyForPaper ? 'has-file' : ''}`} style={{ flex: 1, minWidth: '180px' }}>
+              {answerKeyForPaper ? answerKeyForPaper.name : 'Click to select answer key PDF / TXT'}
+              <input type="file" accept=".pdf,.txt" style={{ display: 'none' }} onChange={e => setAnswerKeyForPaper(e.target.files[0] || null)} />
             </label>
-            <button onClick={() => handleMatchAnswerKey(selectedPaper.source_paper_id)} disabled={matchingAnswerKey || !answerKeyForPaper} style={{ whiteSpace: 'nowrap' }}>
+            {akSetNumber && (
+              <span style={{ fontSize: '13px', color: '#6b8a80', whiteSpace: 'nowrap' }}>Set: {akSetNumber}</span>
+            )}
+            <button onClick={handleMatchAnswerKey} disabled={matchingAnswerKey || !answerKeyForPaper} style={{ whiteSpace: 'nowrap' }}>
               {matchingAnswerKey ? 'Matching...' : 'Match Answers'}
             </button>
           </div>
+          <p style={{ fontSize: '12px', color: '#6b8a80', marginTop: '6px' }}>
+            To match one answer key across multiple papers, go back and use the multi-select in the Extracted Papers table.
+          </p>
         </div>
         {loadingQuestions ? <p>Loading questions...</p> : (
           <div>
@@ -396,19 +592,47 @@ export default function ExamPaperUploads({ showStatus }) {
           </div>
         </div>
 
-        <div className="form-group">
-          <label>Select Folder *</label>
-          <label className={`file-input-label ${bulkPapers.length > 0 ? 'has-file' : ''}`}>
-            {bulkPapers.length > 0 ? `${bulkPapers.length} PDFs found` : 'Click to select folder'}
+        <div className="form-row">
+          <div className="form-group">
+            <label>Subject * <span style={{ fontWeight: 400, color: '#6b8a80', fontSize: '12px' }}>(applies to all papers)</span></label>
+            <select value={bulkSubject} onChange={e => {
+              setBulkSubject(e.target.value)
+              if (bulkPapers.length > 0) setBulkPapers(prev => prev.map(r => ({ ...r, subject: e.target.value })))
+            }}>
+              <option value="">Select subject</option>
+              {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Year * <span style={{ fontWeight: 400, color: '#6b8a80', fontSize: '12px' }}>(applies to all papers)</span></label>
             <input
-              type="file"
-              style={{ display: 'none' }}
-              webkitdirectory=""
-              directory=""
-              multiple
-              onChange={handleBulkFolderChange}
+              type="text"
+              value={bulkYear}
+              onChange={e => {
+                setBulkYear(e.target.value)
+                if (bulkPapers.length > 0) setBulkPapers(prev => prev.map(r => ({ ...r, year: e.target.value })))
+              }}
+              placeholder="e.g. 2025"
+              style={{ padding: '8px 12px', border: '1px solid #c5d5d2', borderRadius: '8px', fontSize: '14px', width: '100%' }}
             />
-          </label>
+          </div>
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label>Question Papers Folder *</label>
+            <label className={`file-input-label ${bulkPapers.length > 0 ? 'has-file' : ''}`}>
+              {bulkPapers.length > 0 ? `${bulkPapers.length} QPs found` : 'Click to select folder'}
+              <input type="file" style={{ display: 'none' }} webkitdirectory="" directory="" multiple onChange={handleBulkFolderChange} />
+            </label>
+          </div>
+          <div className="form-group">
+            <label>Answer Keys Folder <span style={{ fontWeight: 400, color: '#6b8a80', fontSize: '12px' }}>(optional)</span></label>
+            <label className={`file-input-label ${bulkAnswerFiles.length > 0 ? 'has-file' : ''}`}>
+              {bulkAnswerFiles.length > 0 ? `${bulkAnswerFiles.length} answer keys found` : 'Click to select folder'}
+              <input type="file" style={{ display: 'none' }} webkitdirectory="" directory="" multiple onChange={handleAnswerKeyFolderChange} />
+            </label>
+          </div>
         </div>
 
         {bulkPapers.length > 0 && (
@@ -417,21 +641,31 @@ export default function ExamPaperUploads({ showStatus }) {
               <thead>
                 <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
                   <th style={{ padding: '6px 8px' }}>File</th>
+                  <th style={{ padding: '6px 8px' }}>Paper Label</th>
                   <th style={{ padding: '6px 8px' }}>Subject</th>
                   <th style={{ padding: '6px 8px' }}>Year</th>
+                  <th style={{ padding: '6px 8px' }}>Set No</th>
                   <th style={{ padding: '6px 8px' }}>Type</th>
+                  <th style={{ padding: '6px 8px' }}>Answer Key</th>
+                  <th style={{ padding: '6px 8px' }}></th>
                 </tr>
               </thead>
               <tbody>
                 {bulkPapers.map((row, i) => (
                   <tr key={i} style={{ borderBottom: '1px solid #e0e8e6' }}>
-                    <td style={{ padding: '6px 8px', color: '#4a6e6a', maxWidth: '240px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.file.name}</td>
+                    <td style={{ padding: '6px 8px', color: '#4a6e6a', maxWidth: '200px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.file.name}</td>
+                    <td style={{ padding: '6px 8px', fontWeight: '600', color: '#2d4a47', whiteSpace: 'nowrap' }}>
+                      {buildPaperLabel(row.year, row.subject?.slice(0, 3), row.setNumber)}
+                    </td>
                     <td style={{ padding: '6px 8px' }}>
-                      <input
+                      <select
                         value={row.subject}
                         onChange={e => updateBulkRow(i, 'subject', e.target.value)}
-                        style={{ width: '120px', padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
-                      />
+                        style={{ padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
+                      >
+                        <option value="">— subject —</option>
+                        {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+                      </select>
                     </td>
                     <td style={{ padding: '6px 8px' }}>
                       <input
@@ -439,6 +673,14 @@ export default function ExamPaperUploads({ showStatus }) {
                         onChange={e => updateBulkRow(i, 'year', e.target.value)}
                         placeholder="e.g. 2024"
                         style={{ width: '72px', padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
+                      />
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <input
+                        value={row.setNumber}
+                        onChange={e => updateBulkRow(i, 'setNumber', e.target.value)}
+                        placeholder="e.g. 65/1/1"
+                        style={{ width: '80px', padding: '3px 6px', border: '1px solid #c5d5d2', borderRadius: '4px', fontSize: '13px' }}
                       />
                     </td>
                     <td style={{ padding: '6px 8px' }}>
@@ -450,6 +692,17 @@ export default function ExamPaperUploads({ showStatus }) {
                         <option value="board_exam">Board Exam</option>
                         <option value="sample_paper">Sample Paper</option>
                       </select>
+                    </td>
+                    <td style={{ padding: '6px 8px', fontSize: '12px', color: row.answerKeyFile ? '#2e7d5a' : '#aaa' }}>
+                      {row.answerKeyFile ? row.answerKeyFile.name : '—'}
+                    </td>
+                    <td style={{ padding: '6px 4px', textAlign: 'center' }}>
+                      <button
+                        onClick={() => removeBulkPaper(i)}
+                        disabled={bulkProcessing}
+                        title="Remove from queue"
+                        style={{ background: 'none', border: 'none', color: '#bbb', cursor: bulkProcessing ? 'not-allowed' : 'pointer', fontSize: '17px', lineHeight: 1, padding: '0 4px' }}
+                      >×</button>
                     </td>
                   </tr>
                 ))}
@@ -490,6 +743,7 @@ export default function ExamPaperUploads({ showStatus }) {
                   <th style={{ padding: '6px 8px' }}>Extracted</th>
                   <th style={{ padding: '6px 8px' }}>Saved</th>
                   <th style={{ padding: '6px 8px' }}>Duplicates</th>
+                  <th style={{ padding: '6px 8px' }}>Answers Matched</th>
                   <th style={{ padding: '6px 8px' }}>Status</th>
                 </tr>
               </thead>
@@ -501,6 +755,7 @@ export default function ExamPaperUploads({ showStatus }) {
                     <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.extracted}</td>
                     <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.saved}</td>
                     <td style={{ padding: '6px 8px' }}>{r.error ? '—' : r.skipped}</td>
+                    <td style={{ padding: '6px 8px' }}>{r.error ? '—' : (r.answersMatched ?? '—')}</td>
                     <td style={{ padding: '6px 8px' }}>
                       {r.error
                         ? <span style={{ color: '#c0392b', fontSize: '12px' }}>{r.error}</span>
@@ -565,15 +820,15 @@ export default function ExamPaperUploads({ showStatus }) {
           <div className="form-group">
             <label>{paperType === 'exam_paper' ? 'Exam Paper PDF *' : 'Sample Paper PDF *'}</label>
             <label className={`file-input-label ${examPaperFile ? 'has-file' : ''}`}>
-              {examPaperFile ? examPaperFile.name : 'Click to select PDF'}
-              <input type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => setExamPaperFile(e.target.files[0] || null)} />
+              {examPaperFile ? examPaperFile.name : 'Click to select PDF or TXT'}
+              <input type="file" accept=".pdf,.txt" style={{ display: 'none' }} onChange={e => setExamPaperFile(e.target.files[0] || null)} />
             </label>
           </div>
           <div className="form-group">
-            <label>Answer Key PDF (optional)</label>
+            <label>Answer Key PDF/TXT (optional)</label>
             <label className={`file-input-label ${answerKeyFile ? 'has-file' : ''}`}>
-              {answerKeyFile ? answerKeyFile.name : 'Click to select PDF'}
-              <input type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => setAnswerKeyFile(e.target.files[0] || null)} />
+              {answerKeyFile ? answerKeyFile.name : 'Click to select PDF or TXT'}
+              <input type="file" accept=".pdf,.txt" style={{ display: 'none' }} onChange={e => setAnswerKeyFile(e.target.files[0] || null)} />
             </label>
           </div>
 
@@ -596,47 +851,131 @@ export default function ExamPaperUploads({ showStatus }) {
 
       {divider}
 
-      {/* ── Section 3: Extracted papers table ── */}
+      {/* ── Section 3: Extracted papers (grouped by subject) ── */}
       <div className="form-panel">
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
           {sectionTitle('Extracted Papers')}
           <button onClick={fetchPapers} style={{ background: 'none', border: '1px solid #4a6e6a', color: '#4a6e6a', padding: '4px 12px', borderRadius: '6px', cursor: 'pointer', fontSize: '13px', marginTop: '-16px' }}>Refresh</button>
         </div>
+
+        {/* Answer key + match bar — shown when papers exist */}
+        {papers.length > 0 && (
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', marginBottom: '20px', padding: '10px 14px', background: '#f0f4f3', borderRadius: '8px', flexWrap: 'wrap' }}>
+            <label className={`file-input-label ${sectionAKFile ? 'has-file' : ''}`} style={{ flex: 1, minWidth: '180px', margin: 0 }}>
+              {sectionAKFile ? sectionAKFile.name : 'Select answer key for checked papers'}
+              <input type="file" accept=".pdf,.txt" style={{ display: 'none' }} onChange={e => setSectionAKFile(e.target.files[0] || null)} />
+            </label>
+            <button
+              onClick={handleSectionMatchAK}
+              disabled={sectionAKMatching || !sectionAKFile || checkedPaperIds.size === 0}
+              style={{ whiteSpace: 'nowrap' }}
+            >
+              {sectionAKMatching ? 'Matching...' : checkedPaperIds.size > 0 ? `Match Answers (${checkedPaperIds.size} paper${checkedPaperIds.size > 1 ? 's' : ''})` : 'Match Answers'}
+            </button>
+          </div>
+        )}
+
         {loadingPapers ? <p>Loading...</p> : papers.length === 0 ? (
           <p style={{ color: '#6b8a80' }}>No questions extracted yet. Upload a paper with the checkbox ticked.</p>
-        ) : (
-          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '14px' }}>
-            <thead>
-              <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
-                <th style={{ padding: '8px' }}>Subject</th>
-                <th style={{ padding: '8px' }}>Board</th>
-                <th style={{ padding: '8px' }}>Class</th>
-                <th style={{ padding: '8px' }}>Year</th>
-                <th style={{ padding: '8px' }}>Type</th>
-                <th style={{ padding: '8px' }}>Questions</th>
-                <th style={{ padding: '8px' }}>Answers</th>
-                <th style={{ padding: '8px' }}></th>
-              </tr>
-            </thead>
-            <tbody>
-              {papers.map(p => (
-                <tr key={p.source_paper_id} style={{ borderBottom: '1px solid #e0e8e6' }}>
-                  <td style={{ padding: '8px' }}>{p.subject}</td>
-                  <td style={{ padding: '8px' }}>{p.board}</td>
-                  <td style={{ padding: '8px' }}>{p.class_level}</td>
-                  <td style={{ padding: '8px' }}>{p.year || '—'}</td>
-                  <td style={{ padding: '8px' }}>{p.exam_type}</td>
-                  <td style={{ padding: '8px' }}>{p.total}</td>
-                  <td style={{ padding: '8px' }}>
-                    {p.pending === 0 ? <span style={{ color: '#2e7d5a' }}>All matched</span> : <span style={{ color: '#856404' }}>{p.pending} pending</span>}
-                  </td>
-                  <td style={{ padding: '8px' }}>
-                    <button onClick={() => viewQuestions(p.source_paper_id)} style={{ background: 'none', border: '1px solid #4a6e6a', color: '#4a6e6a', padding: '3px 10px', borderRadius: '5px', cursor: 'pointer', fontSize: '12px' }}>View</button>
-                  </td>
+        ) : (() => {
+          // Group by real subject name, sort within each group by set number
+          const groups = {}
+          for (const p of papers) {
+            const subj = extractSubjectFromLabel(p.subject)
+            if (!groups[subj]) groups[subj] = []
+            groups[subj].push(p)
+          }
+          for (const subj of Object.keys(groups)) {
+            groups[subj].sort((a, b) =>
+              extractSetNumberFromLabel(a.subject).localeCompare(extractSetNumberFromLabel(b.subject), undefined, { numeric: true, sensitivity: 'base' })
+            )
+          }
+          return Object.entries(groups).sort((a, b) => a[0].localeCompare(b[0])).map(([subj, grp]) => {
+            const allChecked = grp.every(p => checkedPaperIds.has(p.source_paper_id))
+            const someChecked = grp.some(p => checkedPaperIds.has(p.source_paper_id))
+            return (
+              <div key={subj} style={{ marginBottom: '20px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '6px 0', borderBottom: '2px solid #e0e8e6', marginBottom: '2px' }}>
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    ref={el => { if (el) el.indeterminate = someChecked && !allChecked }}
+                    onChange={e => {
+                      const next = new Set(checkedPaperIds)
+                      grp.forEach(p => e.target.checked ? next.add(p.source_paper_id) : next.delete(p.source_paper_id))
+                      setCheckedPaperIds(next)
+                    }}
+                    style={{ width: '15px', height: '15px', cursor: 'pointer', accentColor: '#4a6e6a' }}
+                  />
+                  <strong style={{ color: '#2d4a47', fontSize: '13px', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{subj}</strong>
+                  <span style={{ fontSize: '12px', color: '#6b8a80' }}>{grp.length} paper{grp.length > 1 ? 's' : ''}</span>
+                </div>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                  <tbody>
+                    {grp.map(p => (
+                      <tr key={p.source_paper_id} style={{ borderBottom: '1px solid #f0f4f3' }}>
+                        <td style={{ padding: '6px 8px', width: '28px' }}>
+                          <input
+                            type="checkbox"
+                            checked={checkedPaperIds.has(p.source_paper_id)}
+                            onChange={e => {
+                              const next = new Set(checkedPaperIds)
+                              e.target.checked ? next.add(p.source_paper_id) : next.delete(p.source_paper_id)
+                              setCheckedPaperIds(next)
+                            }}
+                            style={{ width: '14px', height: '14px', cursor: 'pointer', accentColor: '#4a6e6a' }}
+                          />
+                        </td>
+                        <td style={{ padding: '6px 8px', fontWeight: '600', color: '#2d4a47' }}>{p.subject}</td>
+                        <td style={{ padding: '6px 8px', color: '#6b8a80', fontSize: '12px' }}>{p.board} · Class {p.class_level}</td>
+                        <td style={{ padding: '6px 8px', color: '#6b8a80', fontSize: '12px' }}>{p.exam_type?.replace('_', ' ')}</td>
+                        <td style={{ padding: '6px 8px', fontSize: '12px' }}>{p.total} Q</td>
+                        <td style={{ padding: '6px 8px', fontSize: '12px' }}>
+                          {p.pending === 0
+                            ? <span style={{ color: '#2e7d5a' }}>All matched</span>
+                            : <span style={{ color: '#856404' }}>{p.pending} pending</span>}
+                        </td>
+                        <td style={{ padding: '6px 8px' }}>
+                          <button onClick={() => viewQuestions(p.source_paper_id)} style={{ background: 'none', border: '1px solid #4a6e6a', color: '#4a6e6a', padding: '2px 8px', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}>View</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )
+          })
+        })()}
+
+        {/* Match results */}
+        {sectionAKResults.length > 0 && (
+          <div style={{ marginTop: '16px', borderTop: '1px solid #e0e8e6', paddingTop: '12px' }}>
+            <strong style={{ fontSize: '13px' }}>Match Results</strong>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px', marginTop: '8px' }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid #e0e8e6', textAlign: 'left' }}>
+                  <th style={{ padding: '5px 8px' }}>Paper</th>
+                  <th style={{ padding: '5px 8px' }}>Matched</th>
+                  <th style={{ padding: '5px 8px' }}>Rejected</th>
+                  <th style={{ padding: '5px 8px' }}>Status</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sectionAKResults.map((r, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid #f0f4f3' }}>
+                    <td style={{ padding: '5px 8px' }}>{r.subject}</td>
+                    <td style={{ padding: '5px 8px' }}>{r.error ? '—' : r.matched}</td>
+                    <td style={{ padding: '5px 8px' }}>{r.error ? '—' : r.rejected}</td>
+                    <td style={{ padding: '5px 8px' }}>
+                      {r.error
+                        ? <span style={{ color: '#c0392b', fontSize: '12px' }}>{r.error}</span>
+                        : <span style={{ color: '#2e7d5a', fontSize: '12px' }}>Done</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 

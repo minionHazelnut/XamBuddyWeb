@@ -1,8 +1,11 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.exceptions import RequestValidationError
 from typing import Optional, Literal
 import json
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import re
 import random
 import logging
@@ -12,11 +15,24 @@ import uuid
 from datetime import datetime
 from pypdf import PdfReader
 import io
+import zipfile
+from collections import Counter
 import anthropic
+from striprtf.striprtf import rtf_to_text
+try:
+    import fitz  # PyMuPDF — used by split-PDF endpoints
+    _FITZ_AVAILABLE = True
+except ImportError:
+    _FITZ_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="XamBuddy API")
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print(f"[422] Validation error on {request.url.path}: {exc.errors()}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -46,6 +62,33 @@ def _sb_get(table, params=None):
     req = urllib.request.Request(url, headers=_sb_headers())
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read())
+
+def _sb_get_all(table, params=None):
+    """Fetch all rows using Range pagination to bypass Supabase's 1000-row default cap."""
+    base_params = dict(params or {})
+    # Remove any caller-specified limit — we control pagination
+    base_params.pop("limit", None)
+    url_base = f"{SUPABASE_URL}/rest/v1/{table}"
+    if base_params:
+        url_base += "?" + urllib.parse.urlencode(base_params)
+    all_rows = []
+    page_size = 1000
+    offset = 0
+    while True:
+        headers = {**_sb_headers(), "Range": f"{offset}-{offset + page_size - 1}"}
+        req = urllib.request.Request(url_base, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                batch = json.loads(resp.read())
+        except Exception:
+            break
+        if not batch:
+            break
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return all_rows
 
 def _sb_patch(table, id_val, data):
     url = f"{SUPABASE_URL}/rest/v1/{table}?id=eq.{id_val}"
@@ -187,9 +230,9 @@ def _get_existing_exam_question_fingerprints(subject, class_level, board):
     except Exception:
         return set()
 
-def _save_exam_questions(questions, subject, class_level, board, year, exam_type, source_paper_id):
+def _save_exam_questions(questions, subject, class_level, board, year, exam_type, source_paper_id, paper_pdf_url=None):
     existing = _get_existing_exam_question_fingerprints(subject, class_level, board)
-    type_map = {"MCQ": "mcq", "VSA": "vsa", "SA": "sa", "LA": "la", "CBQ": "cbq"}
+    type_map = {"MCQ": "mcq", "VSA": "vsa", "SA": "sa", "LA": "la", "CBQ": "cbq", "AR": "ar"}
     to_insert = []
     skipped = 0
     for q in questions:
@@ -221,6 +264,9 @@ def _save_exam_questions(questions, subject, class_level, board, year, exam_type
             "difficulty_level": (q.get("difficulty_level") or "").lower() or None,
             "answer_pending": True,
             "source_paper_id": source_paper_id,
+            "question_number": str(q.get("question_number") or "").strip() or None,
+            "has_diagram": bool(q.get("has_diagram")),
+            "paper_pdf_url": paper_pdf_url or None,
         }
         to_insert.append(row)
         existing.add(norm)
@@ -333,8 +379,14 @@ def get_cached_questions(q_type, difficulty, subject, exam, chapter, limit):
 # ---------- PDF helpers ----------
 
 def extract_text(file_bytes):
-    reader = PdfReader(io.BytesIO(file_bytes))
-    return "".join(page.extract_text() or "" for page in reader.pages)
+    reader = PdfReader(io.BytesIO(file_bytes), strict=False)
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            texts.append("")
+    return "".join(texts)
 
 def truncate_text(text, max_chars=18000):
     return text[:max_chars] if len(text) > max_chars else text
@@ -512,19 +564,16 @@ TYPE_RULES = {
 - Return ONLY a valid JSON array.""",
 
     "short": """Short Answer (SA) rules (follow strictly):
-- Every question must begin with: Explain, Describe, Why does, How does, What is the significance of, Differentiate between, What happens when, or a similar prompt that demands explanation.
-- NO one-word or one-line answer questions allowed.
-- Answer format (40–70 words, complete sentences): one sentence of context → one to two sentences of core explanation → one sentence of implication or example if applicable.
-- Include all key terms a CBSE examiner would look for in the answer.
-- explanation field: note what keywords/concepts make this answer score full marks.
+- For practical/numerical questions (is_practical=true): pose a problem with given values and ask to find/calculate/solve. Answer must show every step of working exactly as the textbook solved examples do, with units and final answer clearly stated.
+- For theory questions (is_practical=false): begin with Explain, Describe, Why does, How does, Differentiate between, etc. Answer: 40–70 words, one context sentence → core explanation → implication/example.
+- NO vague one-word or one-line answers.
+- explanation field: note the key steps or keywords that earn full marks.
 - Return ONLY a valid JSON array.""",
 
     "long": """Long Answer (LA) rules (follow strictly):
-- Questions must use: why, how, explain in detail, analyse, discuss, compare, evaluate.
-- Answer structure (max 120 words, complete paragraphs): proper introduction sentence setting context → core explanation covering every sub-point a CBSE marking scheme awards marks for → concluding sentence summarising or stating significance.
-- All keywords an examiner would look for must appear throughout introduction, body, and conclusion.
-- Note "[include diagram of X here]" in the answer where a diagram is relevant.
-- explanation field: list the key points that would earn marks in a CBSE marking scheme.
+- For practical/numerical questions (is_practical=true): multi-step problem with given data. Answer must show complete working in the same step-by-step format as textbook examples — state formula, substitute values, calculate, state final answer with units.
+- For theory questions (is_practical=false): use why, how, explain in detail, analyse, compare. Answer: max 120 words, introduction → core explanation → conclusion. Include "[include diagram of X here]" where relevant.
+- explanation field: list every step/keyword a CBSE marking scheme awards marks for.
 - Return ONLY a valid JSON array.""",
 
     "conceptual": """Conceptual/Long Answer rules (follow strictly):
@@ -604,6 +653,101 @@ def _parse_ai_questions_json(raw, stop_reason):
         return None, "Model output was not a JSON array."
     return data, None
 
+# ---------- Split-PDF helpers ----------
+
+_SPLIT_CHAPTER_PREFIX = re.compile(
+    r'^(chapter|ch\.?|unit|section|part)\s*[\d\w]+\.?\s*',
+    re.IGNORECASE,
+)
+
+def _split_clean_title(raw: str) -> str:
+    cleaned = _SPLIT_CHAPTER_PREFIX.sub('', raw).strip()
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned if cleaned else raw.strip()
+
+def _split_extract_subject_name(filename: str) -> str:
+    from pathlib import Path as _Path
+    stem = _Path(filename).stem
+    cleaned = re.sub(r'^class\s+\d+\s+\w+\s+', '', stem, flags=re.IGNORECASE).strip()
+    if not cleaned:
+        cleaned = stem
+    cleaned = re.sub(r'[-_]+', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+def _split_detect_body_font_size(doc) -> float:
+    size_weight: Counter = Counter()
+    sample = min(len(doc), 30)
+    for page_idx in range(sample):
+        for block in doc[page_idx].get_text("dict")["blocks"]:
+            if block["type"] != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    chars = len(span["text"].strip())
+                    if chars > 0:
+                        size_weight[round(span["size"], 1)] += chars
+    if not size_weight:
+        return 12.0
+    return size_weight.most_common(1)[0][0]
+
+def _split_page_chapter_title(page, body_size: float, threshold_multiplier: float) -> Optional[str]:
+    top_half_y = page.rect.height * 0.5
+    min_size = body_size * threshold_multiplier
+    bold_min_size = body_size * 1.1
+    title_parts = []
+    found_prominent = False
+    blocks = sorted(
+        page.get_text("dict")["blocks"],
+        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],
+    )
+    for block in blocks:
+        if block["type"] != 0:
+            continue
+        if block.get("bbox", [0, 0, 0, 0])[1] > top_half_y:
+            break
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span["text"].strip()
+                if not text:
+                    continue
+                size = span["size"]
+                is_bold = bool(span["flags"] & 16)
+                if size >= min_size or (is_bold and size >= bold_min_size):
+                    title_parts.append(text)
+                    found_prominent = True
+    if not found_prominent or not title_parts:
+        return None
+    raw = " ".join(title_parts).strip()
+    if len(raw) < 2:
+        return None
+    return _split_clean_title(raw)
+
+def _split_find_chapters(doc, body_size: float, threshold_multiplier: float) -> list:
+    raw_hits = []
+    for page_idx in range(len(doc)):
+        title = _split_page_chapter_title(doc[page_idx], body_size, threshold_multiplier)
+        if title:
+            raw_hits.append((page_idx, title))
+    # Discard watermarks: text starting with @ or appearing on 3+ pages
+    title_counts: Counter = Counter(t for _, t in raw_hits)
+    raw_hits = [
+        (p, t) for p, t in raw_hits
+        if title_counts[t] < 3 and not t.startswith('@')
+    ]
+    merged = []
+    for page_idx, title in raw_hits:
+        if merged and page_idx - merged[-1][0] <= 1:
+            prev_idx, prev_title = merged[-1]
+            combined = (prev_title + " " + title).strip() if prev_title not in title else prev_title
+            merged[-1] = (prev_idx, combined)
+        else:
+            merged.append((page_idx, title))
+    return merged
+
+def _split_safe_filename(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|\n\r\t]+', '', name).strip()
+
 # ---------- API endpoints ----------
 
 @app.get("/api/health")
@@ -646,7 +790,7 @@ async def retrieve_questions(
 @app.get("/api/stats")
 async def get_stats():
     try:
-        rows = _sb_get("questions", {"select": "exam,subject,chapter,question_type"})
+        rows = _sb_get_all("questions", {"select": "exam,subject,chapter,question_type"})
         counts = {}
         for r in rows:
             key = (r.get("exam"), r.get("subject"), r.get("chapter"), r.get("question_type"))
@@ -677,6 +821,7 @@ async def generate_from_pdf(
     exam: str = Form("general"),
     chapter: str = Form(...),
     chapter_order: Optional[int] = Form(None),
+    title_edited: bool = Form(False),
 ):
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
@@ -698,18 +843,21 @@ async def generate_from_pdf(
     full_text = truncate_text(text, 80000)
 
     # Consistency check: verify chapter name matches PDF content
-    chapter_words = [w for w in re.sub(r'[^a-z\s]', '', chapter.lower()).split() if len(w) >= 4]
-    if chapter_words:
-        first_chunk = full_text[:4000].lower()
-        matched = sum(1 for w in chapter_words if w in first_chunk)
-        match_ratio = matched / len(chapter_words)
-        if match_ratio < 0.25:
-            err_msg = (f"Chapter mismatch: '{chapter}' does not appear to match the uploaded PDF "
-                       f"({matched}/{len(chapter_words)} title words found in PDF). "
-                       f"Please verify you selected the correct chapter and uploaded the correct PDF.")
-            _log_error("/api/generate", "chapter_title_mismatch", err_msg,
-                       {"subject": subject, "exam": exam, "chapter": chapter, "match_ratio": round(match_ratio, 2)})
-            return JSONResponse(status_code=422, content={"error": err_msg})
+    # Skipped if the admin manually edited/confirmed the title — their input is authoritative
+    if not title_edited:
+        chapter_clean = re.sub(r'[-_/]', ' ', chapter.lower())
+        chapter_words = [w for w in re.sub(r'[^a-z\s]', '', chapter_clean).split() if len(w) >= 4]
+        if chapter_words:
+            search_chunk = full_text[:15000].lower()
+            matched = sum(1 for w in chapter_words if w in search_chunk)
+            match_ratio = matched / len(chapter_words)
+            if match_ratio < 0.15:
+                err_msg = (f"Chapter mismatch: '{chapter}' does not appear to match the uploaded PDF "
+                           f"({matched}/{len(chapter_words)} title words found in first 15k chars). "
+                           f"Edit the chapter title in the list to match the PDF, then re-run.")
+                _log_error("/api/generate", "chapter_title_mismatch", err_msg,
+                           {"subject": subject, "exam": exam, "chapter": chapter, "match_ratio": round(match_ratio, 2)})
+                return JSONResponse(status_code=422, content={"error": err_msg})
 
     # Step 1: analyse chapter — get practical/theory split and headings
     chapter_id, practical_pct, theory_pct, headings = _get_or_store_chapter_meta(
@@ -744,14 +892,23 @@ NUMBER OF QUESTIONS TO GENERATE: {num_q}
 
 PRACTICAL vs THEORY SPLIT: This chapter is {practical_pct}% practical and {theory_pct}% theory. Of the {num_q} questions, generate approximately {practical_count} as numerical/applied/practical questions and {theory_count} as conceptual/theoretical questions. Set is_practical to true for practical questions and false for theory questions.
 
+EXERCISE ANALYSIS RULE (most important):
+Before generating, scan the chapter content for numbered exercises (e.g. Exercise 5.1, Exercise 5.2, Q1/Q2 under each exercise, etc.) and worked/solved examples.
+- Count how many questions appear in each exercise and what TYPE they are (numerical calculation, word problem, proof, fill-in-the-blank, match, etc.).
+- Generate questions of the EXACT SAME TYPE and difficulty distribution as found in those exercises — do not invent a different style.
+- For every solved/worked example in the chapter, treat it as a TEMPLATE: generate a new question by changing the numbers, variables, or scenario while keeping the same solving method and structure.
+- The answer for each generated question must follow the SAME step-by-step solution format as the solved examples in the chapter. Show all working steps the same way the textbook does.
+- If the chapter has 3 exercises with 10 numerical problems, 5 word problems, and 2 proofs, your output must reflect roughly that ratio.
+- NEVER generate vague theory questions like "What is X?" when the chapter exercises are numerical — match the exercise style exactly.
+
 RULES FOR THIS QUESTION TYPE:
 {TYPE_RULES.get(q_type, '')}
 
-COVERAGE RULE: Generate questions proportionally from across the ENTIRE chapter content below. Do NOT concentrate questions on the introduction or any single section. Identify all major topics/headings in the content and ensure each is represented.
+COVERAGE RULE: Spread questions across ALL exercises and topics in the chapter — do not concentrate on the first exercise or introduction. Every exercise section must be represented.
 
-ANSWER QUALITY RULE: Every answer must include all important keywords that CBSE examiners look for. Answers must be written in complete sentences such that a student who memorises them will score full marks in any school, board, or competitive exam on this topic.
+ANSWER QUALITY RULE: Answers must follow the step-by-step format of the textbook's solved examples. Show each calculation step. Include units where applicable. A student who reads only the answer must be able to reproduce the full solution from memory.
 
-SELF-CONTAINED RULE: Do NOT reference figures, tables, examples by number, or page numbers from the PDF. Every question and answer must be fully self-contained.
+SELF-CONTAINED RULE: Do NOT reference figures, tables, examples, or page numbers by their textbook label. Every question must work as a standalone problem with all values/context given in the question itself.
 
 OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
 {FORMAT_EXAMPLES.get(q_type, '')}
@@ -766,14 +923,43 @@ CHAPTER CONTENT:
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=MAX_TOKENS_FOR_TYPE[q_type],
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "["},
+        ],
     )
 
-    raw = response.content[0].text
+    raw = "[" + response.content[0].text
     stop_reason = getattr(response, "stop_reason", None)
     data, parse_err = _parse_ai_questions_json(raw, stop_reason)
+
+    # Retry once with a stripped-down prompt if model returned non-JSON
     if parse_err:
-        return {"error": parse_err, "raw": raw}
+        retry_prompt = (
+            f"Generate {num_q} {q_type} questions for the chapter '{chapter}' (subject: {subject}).\n\n"
+            f"Return ONLY a valid JSON array. No explanation, no markdown, no preamble. "
+            f"Start your response with [ and end with ].\n\n"
+            f"Format: {FORMAT_EXAMPLES.get(q_type, '')}\n\n"
+            f"Chapter content:\n{full_text[:40000]}"
+        )
+        try:
+            retry_resp = claude_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=MAX_TOKENS_FOR_TYPE[q_type],
+                messages=[
+                    {"role": "user", "content": retry_prompt},
+                    {"role": "assistant", "content": "["},
+                ],
+            )
+            retry_raw = "[" + retry_resp.content[0].text
+            data, parse_err = _parse_ai_questions_json(retry_raw, getattr(retry_resp, "stop_reason", None))
+        except Exception:
+            pass
+        if parse_err:
+            _log_error("/api/generate", "json_parse_failed",
+                       f"{parse_err} | raw preview: {raw[:400]}",
+                       {"subject": subject, "chapter": chapter, "q_type": q_type, "exam": exam})
+            return {"error": parse_err, "raw": raw}
 
     try:
         save_questions(data, q_type, difficulty, subject, exam, chapter, source_chapter_id=chapter_id)
@@ -800,6 +986,7 @@ async def extract_paper(
     year: str = Form(...),
     exam_type: str = Form(...),
     source_paper_id: Optional[str] = Form(None),
+    paper_pdf_url: Optional[str] = Form(None),
 ):
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
@@ -807,11 +994,18 @@ async def extract_paper(
         raise HTTPException(status_code=500, detail="Supabase service key not configured")
 
     content = await file.read()
-    try:
-        text = extract_text(content)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+    print(f"[extract-paper] file={file.filename} size={len(content)} bytes subject={subject}")
+    if file.filename.lower().endswith('.txt'):
+        text = content.decode('utf-8', errors='replace')
+    else:
+        try:
+            text = extract_text(content)
+        except Exception as e:
+            print(f"[extract-paper] ERROR reading PDF: {e}")
+            raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+    print(f"[extract-paper] extracted text length={len(text.strip())} chars")
     if not text.strip():
+        print(f"[extract-paper] REJECTED: no text found in {file.filename}")
         raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
     paper_id = source_paper_id or str(uuid.uuid4())
@@ -826,38 +1020,60 @@ Board: {board}
 Year: {year}
 Exam Type: {exam_type}
 
+═══ CRITICAL RULE — FULL QUESTION TEXT ═══
+A question is EVERYTHING from its number (e.g. Q5.) up to but NOT including the next question number.
+This includes: the instruction line, any sentence with a blank, any poem/prose excerpt, any table, ALL sub-parts.
+NEVER stop at the first line. If a question spans 10 lines, capture all 10 lines in question_text.
+Example WRONG: question_text = "Fill in the blank with the correct form of the word."
+Example RIGHT:  question_text = "Fill in the blank with the correct form of the word.\nThe student _______ (study) for hours before the exam."
+
+═══ GROUPING RULES — WHEN TO MERGE vs SEPARATE ═══
+
+ALWAYS MERGE into ONE entry:
+  - Comprehension / passage / poem / case-study block: store passage + ALL its sub-questions as ONE entry (question_type CBQ)
+  - Any numbered question whose sub-parts (a)(b)(c) or (i)(ii)(iii) are clearly about the SAME topic/chapter
+
+ALWAYS SEPARATE into individual entries:
+  - "Answer any X of the following Y questions" sections — each option is a separate standalone question
+  - Grammar exercises — each numbered item is a separate entry
+  - Writing tasks — each task (letter/article/story etc.) is a separate entry
+  - Sub-questions from clearly different topics even if numbered under one heading
+
+═══ LANGUAGE RULE ═══
+This paper may contain questions printed in both English and Hindi (bilingual format).
+Extract ONLY the English questions. Completely ignore any Hindi text, Hindi questions, or Hindi instructions.
+If the same question appears in both languages, extract it only once using the English version.
+
+═══ DIAGRAM RULE ═══
+If a question references a diagram, map, figure, chart, image, or graph (e.g. "refer to the map", "study the diagram", "the figure shows"):
+  - Set has_diagram = true
+  - Add "[DIAGRAM: <brief description of what the visual shows>]" at the start of question_text
+  - Example: "[DIAGRAM: Political map of India] Study the given map and answer the following questions."
+
 ═══ QUESTION TYPE RULES ═══
 
 MCQ — Multiple Choice Question
   - Has four options labelled A/B/C/D or (a)/(b)/(c)/(d) or 1/2/3/4
   - Typically 1 mark
-  - question_text = the question stem only (not the options)
+  - question_text = full question stem INCLUDING any sentence/blank/excerpt (NOT the options)
   - options = {{"A":"...","B":"...","C":"...","D":"..."}}
 
-VSA — Very Short Answer
-  - No options, typically 2 marks
-  - question_text = full question including all its lines
+AR — Assertion and Reason Question
+  - Has an Assertion (A) statement and a Reason (R) statement
+  - Options are fixed combinations like "Both A and R are true and R is the correct explanation..."
+  - question_text = full text including both the Assertion and Reason statements
+  - options = {{"A":"Both A and R are true and R is the correct explanation of A","B":"Both A and R are true but R is not the correct explanation of A","C":"A is true but R is false","D":"A is false but R is true"}}
+  - Only use this type if the paper actually contains Assertion-Reason questions. Do not invent it.
 
-SA — Short Answer
-  - No options, typically 3 marks
-  - question_text = full question including all its lines
+VSA — Very Short Answer (typically 2 marks)
+SA  — Short Answer (typically 3 marks)
+LA  — Long Answer (typically 5 marks)
+  - question_text = every line from its question number to the next question number
 
-LA — Long Answer
-  - No options, typically 5 marks
-  - question_text = full question including all its lines
-
-CBQ — Case-Based Question  ⚠️ SPECIAL HANDLING ⚠️
-  - Starts with a reading passage / case study / data table / graph description
-  - Followed by numbered sub-questions (i), (ii), (iii), (iv) etc.
-  - DO NOT create separate entries for each sub-question
-  - DO NOT put the passage text in question_text and sub-questions in options
-  - INSTEAD:
-      question_text = ONLY the passage/stimulus text (everything before the sub-questions begin)
-      options = {{"sub_questions": [{{"number":"i","text":"sub-question text here","marks":1}}, ...]}}
-      marks = total marks for the entire CBQ block
-  - If you cannot identify a clear passage but see grouped sub-questions under one number, still treat the whole block as one CBQ entry
-
-MULTI-PART NON-CBQ RULE: For SA/LA questions with (a)(b)(c) sub-parts that are NOT preceded by a passage, treat the entire question as one entry with all sub-parts in question_text.
+CBQ — Case-Based / Comprehension / Passage Question
+  - question_text = full passage/case text followed by ALL sub-questions exactly as written
+  - options = {{"sub_questions": [{{"number":"i","text":"...","marks":1}}, ...]}}
+  - marks = total marks for the entire block
 
 ═══ DIFFICULTY RULES ═══
 - easy: factual recall, direct definition, one-step
@@ -867,9 +1083,9 @@ MULTI-PART NON-CBQ RULE: For SA/LA questions with (a)(b)(c) sub-parts that are N
 ═══ OUTPUT FORMAT ═══
 Return ONLY a valid JSON array, no other text:
 [
-  {{"question_number":"1","question_text":"...","question_type":"MCQ","marks":1,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}},
-  {{"question_number":"5","question_text":"passage text only","question_type":"CBQ","marks":5,"options":{{"sub_questions":[{{"number":"i","text":"What is...","marks":1}},{{"number":"ii","text":"Explain...","marks":2}}]}},"chapter":null,"difficulty_level":"medium"}},
-  {{"question_number":"7","question_text":"full question text","question_type":"LA","marks":5,"options":null,"chapter":null,"difficulty_level":"hard"}}
+  {{"question_number":"1","question_text":"...","question_type":"MCQ","marks":1,"has_diagram":false,"options":{{"A":"...","B":"...","C":"...","D":"..."}},"chapter":null,"difficulty_level":"easy"}},
+  {{"question_number":"5","question_text":"passage...\\n(i) What is...\\n(ii) Explain...","question_type":"CBQ","marks":5,"has_diagram":false,"options":{{"sub_questions":[{{"number":"i","text":"What is...","marks":1}},{{"number":"ii","text":"Explain...","marks":2}}]}},"chapter":null,"difficulty_level":"medium"}},
+  {{"question_number":"7","question_text":"[DIAGRAM: circuit diagram with resistors] Calculate the equivalent resistance.","question_type":"SA","marks":3,"has_diagram":true,"options":null,"chapter":null,"difficulty_level":"hard"}}
 ]
 
 QUESTION PAPER:
@@ -878,18 +1094,21 @@ QUESTION PAPER:
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=16000,
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "["},
+        ],
     )
 
-    raw = response.content[0].text
+    raw = "[" + response.content[0].text
     stop_reason = getattr(response, "stop_reason", None)
     data, parse_err = _parse_ai_questions_json(raw, stop_reason)
     if parse_err:
         return {"error": parse_err, "raw": raw}
 
     try:
-        saved, skipped = _save_exam_questions(data, subject, class_level, board, year, exam_type, paper_id)
+        saved, skipped = _save_exam_questions(data, subject, class_level, board, year, exam_type, paper_id, paper_pdf_url)
     except Exception as e:
         _log_error("/api/extract-paper", "save_exam_questions", str(e), {"subject": subject, "paper_id": paper_id})
         return {"questions": data, "save_warning": str(e)}
@@ -906,6 +1125,7 @@ QUESTION PAPER:
 async def match_answer_key(
     file: UploadFile = File(...),
     source_paper_id: str = Form(...),
+    set_number: Optional[str] = Form(None),
 ):
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
@@ -925,12 +1145,15 @@ async def match_answer_key(
         raise HTTPException(status_code=404, detail="No questions found for this source_paper_id.")
 
     content = await file.read()
-    try:
-        text = extract_text(content)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read PDF: {e}")
+    if file.filename.lower().endswith('.txt'):
+        text = content.decode('utf-8', errors='replace')
+    else:
+        try:
+            text = extract_text(content)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
     if not text.strip():
-        raise HTTPException(status_code=400, detail="No text found in the answer key PDF.")
+        raise HTTPException(status_code=400, detail="No text found in the answer key file.")
 
     full_text = truncate_text(text, 60000)
 
@@ -939,14 +1162,24 @@ async def match_answer_key(
         for r in rows
     )
 
+    set_instruction = ""
+    if set_number:
+        set_instruction = f"""
+IMPORTANT — COMBINED ANSWER KEY:
+This answer key file contains answers for MULTIPLE sub-papers (e.g. {set_number.replace('/','/1/')[:10].split('/')[0]}/1/1, /1/2, /1/3 etc.).
+You must extract answers ONLY for set {set_number}. Ignore all other sections.
+Look for a heading or label like "Set {set_number}" or "{set_number.replace('/','-')}" or similar to identify the correct section.
+"""
+
     prompt = f"""You are an expert CBSE answer key analyser. Match every answer in the answer key below to its corresponding question.
 
 QUESTIONS TO MATCH (each has an id):
 {question_list}
-
+{set_instruction}
 INSTRUCTIONS:
 - For each answer in the key, find the matching question by question number or by matching the question text.
 - For MCQ questions: correct_answer must be a single letter A, B, C, or D.
+- For Assertion-Reason (AR) questions: correct_answer must be a single letter A, B, C, or D.
 - For all other types: correct_answer is the full answer text.
 - If you cannot confidently match an answer to a question, skip it — do not guess.
 
@@ -959,11 +1192,14 @@ ANSWER KEY:
     claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = claude_client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=16000,
+        messages=[
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "["},
+        ],
     )
 
-    raw = response.content[0].text
+    raw = "[" + response.content[0].text
     stop_reason = getattr(response, "stop_reason", None)
     data, parse_err = _parse_ai_questions_json(raw, stop_reason)
     if parse_err:
@@ -981,6 +1217,43 @@ ANSWER KEY:
             failed += 1
             continue
         matched_pairs.append({"id": q_id, "answer": answer})
+
+    # Verify Q&A correspondence — reject pairs where answer does not match question
+    mismatch_count = 0
+    if matched_pairs:
+        verify_list = "\n".join(
+            f'id:{p["id"]} | question:{existing_by_id[p["id"]]["question_text"][:200]} | answer:{p["answer"][:200]}'
+            for p in matched_pairs
+        )
+        verify_prompt = f"""You are a CBSE exam answer key validator.
+
+For each question-answer pair below, check if the answer is a direct, correct answer to the question.
+A pair is INVALID if the answer belongs to a different question, is completely unrelated, or makes no sense as a response to that question.
+A pair is VALID if the answer directly addresses what the question asks, even if brief (e.g. "A" is valid for an MCQ, a one-line fact is valid for a direct recall question).
+
+Return ONLY a valid JSON array containing the ids of VALID pairs. No other text.
+Example: ["id1", "id2"]
+
+QUESTION-ANSWER PAIRS:
+{verify_list}"""
+        try:
+            verify_response = claude_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=2048,
+                messages=[{"role": "user", "content": verify_prompt}],
+            )
+            valid_data, _ = _parse_ai_questions_json(verify_response.content[0].text, getattr(verify_response, "stop_reason", None))
+            if valid_data is not None and isinstance(valid_data, list):
+                valid_id_set = set(str(x) for x in valid_data)
+                before = len(matched_pairs)
+                matched_pairs = [p for p in matched_pairs if p["id"] in valid_id_set]
+                mismatch_count = before - len(matched_pairs)
+                if mismatch_count > 0:
+                    _log_error("/api/match-answer-key", "qa_mismatch_rejected",
+                               f"Rejected {mismatch_count} Q&A pairs that did not correspond",
+                               {"source_paper_id": source_paper_id, "total_before": before, "kept": len(matched_pairs)})
+        except Exception:
+            pass  # If verification fails, proceed with original matches
 
     # One Claude call to extract keywords for all matched answers
     keywords_by_id = {}
@@ -1039,6 +1312,7 @@ ANSWERS:
         "source_paper_id": source_paper_id,
         "answers_matched": matched,
         "answers_failed": failed,
+        "mismatched_rejected": mismatch_count,
         "total_questions": len(rows),
     }
 
@@ -1119,7 +1393,7 @@ async def get_meta_options(
 ):
     exams_set, subjects_set = set(), set()
     try:
-        rows = _sb_get("questions", {"select": "exam,subject", "limit": 5000})
+        rows = _sb_get_all("questions", {"select": "exam,subject"})
         for r in rows:
             if r.get("exam"): exams_set.add(r["exam"])
             if r.get("subject") and (not exam or r.get("exam") == exam):
@@ -1256,6 +1530,83 @@ async def get_chapters(
         return {"success": True, "chapters": chapters}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/split-pdf/preview")
+async def split_pdf_preview(
+    file: UploadFile = File(...),
+    start_chapter: int = Form(1),
+    threshold: float = Form(1.4),
+):
+    if not _FITZ_AVAILABLE:
+        raise HTTPException(status_code=500, detail="PyMuPDF not installed. Run: pip install PyMuPDF")
+    content = await file.read()
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
+    total_pages = len(doc)
+    body_size = _split_detect_body_font_size(doc)
+    chapters = _split_find_chapters(doc, body_size, threshold)
+    doc.close()
+    if not chapters:
+        return JSONResponse(status_code=422, content={
+            "error": "No chapters detected. Try lowering the threshold (e.g. 1.2) if headings are not much larger than body text."
+        })
+    result = []
+    for i, (page_idx, title) in enumerate(chapters):
+        end_page = chapters[i + 1][0] if i + 1 < len(chapters) else total_pages
+        result.append({
+            "number": start_chapter + i,
+            "title": title,
+            "start_page": page_idx + 1,
+            "end_page": end_page,
+            "pages": end_page - page_idx,
+        })
+    subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
+    return {"subject_name": subject_name, "body_size": round(body_size, 1), "total_pages": total_pages, "chapters": result}
+
+
+@app.post("/api/split-pdf/download")
+async def split_pdf_download(
+    file: UploadFile = File(...),
+    start_chapter: int = Form(1),
+    threshold: float = Form(1.4),
+):
+    if not _FITZ_AVAILABLE:
+        raise HTTPException(status_code=500, detail="PyMuPDF not installed. Run: pip install PyMuPDF")
+    content = await file.read()
+    try:
+        doc = fitz.open(stream=content, filetype="pdf")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
+    total_pages = len(doc)
+    body_size = _split_detect_body_font_size(doc)
+    chapters = _split_find_chapters(doc, body_size, threshold)
+    if not chapters:
+        doc.close()
+        raise HTTPException(status_code=422, detail="No chapters detected. Try a lower threshold.")
+    subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, (start_page, title) in enumerate(chapters):
+            end_page = chapters[i + 1][0] if i + 1 < len(chapters) else total_pages
+            chapter_num = start_chapter + i
+            pdf_filename = f"{chapter_num}. {_split_safe_filename(title)}.pdf"
+            zip_entry = f"{subject_name}/{pdf_filename}"
+            chapter_doc = fitz.open()
+            chapter_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+            pdf_bytes = chapter_doc.tobytes(deflate=True)
+            chapter_doc.close()
+            zf.writestr(zip_entry, pdf_bytes)
+    doc.close()
+    zip_buffer.seek(0)
+    zip_name = _split_safe_filename(subject_name) + ".zip"
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
 
 
 if __name__ == "__main__":

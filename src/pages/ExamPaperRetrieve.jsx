@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
 const BOARDS = ['CBSE', 'ICSE', 'State']
@@ -22,6 +22,47 @@ export default function ExamPaperRetrieve({ showStatus }) {
   const [loading, setLoading] = useState(false)
   const [results, setResults] = useState(null)
   const [deletingId, setDeletingId] = useState(null)
+
+  const [papers, setPapers] = useState([])
+  const [selectedPaperId, setSelectedPaperId] = useState('')
+  const [paperQuestions, setPaperQuestions] = useState([])
+  const [loadingPaperQs, setLoadingPaperQs] = useState(false)
+
+  useEffect(() => {
+    async function loadPapers() {
+      const { data } = await supabase
+        .from('exam_questions')
+        .select('source_paper_id, subject, board, year, exam_type')
+        .not('source_paper_id', 'is', null)
+      if (!data) return
+      const grouped = {}
+      data.forEach(r => {
+        const id = r.source_paper_id
+        if (!grouped[id]) grouped[id] = { source_paper_id: id, subject: r.subject, board: r.board, year: r.year, exam_type: r.exam_type, count: 0 }
+        grouped[id].count++
+      })
+      setPapers(Object.values(grouped).sort((a, b) => `${a.subject}`.localeCompare(`${b.subject}`)))
+    }
+    loadPapers()
+  }, [])
+
+  async function handlePaperSelect(paperId) {
+    setSelectedPaperId(paperId)
+    setPaperQuestions([])
+    if (!paperId) return
+    setLoadingPaperQs(true)
+    const { data } = await supabase
+      .from('exam_questions')
+      .select('*')
+      .eq('source_paper_id', paperId)
+      .order('created_at', { ascending: true })
+    setPaperQuestions(data || [])
+    setLoadingPaperQs(false)
+  }
+
+  function paperLabel(p) {
+    return `${p.board} · ${p.subject} · ${p.year} (${p.count} qs)`
+  }
 
   function storagePathFromUrl(url) {
     if (!url) return null
@@ -100,6 +141,69 @@ export default function ExamPaperRetrieve({ showStatus }) {
   return (
     <div className="page-content">
       <h2>Exam Paper Retrieve</h2>
+
+      <div className="form-panel" style={{ marginBottom: '24px' }}>
+        <div className="form-group">
+          <label>Browse Extracted Questions by Paper</label>
+          <select
+            value={selectedPaperId}
+            onChange={e => handlePaperSelect(e.target.value)}
+            style={{ maxWidth: '480px' }}
+          >
+            <option value="">— Select a paper —</option>
+            {papers.map(p => (
+              <option key={p.source_paper_id} value={p.source_paper_id}>
+                {paperLabel(p)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {loadingPaperQs && <p style={{ color: '#6b8a80', fontSize: '13px' }}>Loading questions…</p>}
+
+        {paperQuestions.length > 0 && (
+          <div style={{ marginTop: '16px' }}>
+            <p style={{ fontSize: '13px', color: '#6b8a80', marginBottom: '12px' }}>
+              {paperQuestions.length} questions
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              {paperQuestions.map((q, i) => (
+                <div key={q.id} style={{
+                  background: '#f7faf9', border: '1px solid #d5e8e0', borderRadius: '10px', padding: '12px 16px'
+                }}>
+                  <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' }}>
+                    <span style={{ fontSize: '12px', fontWeight: '600', color: '#fff', background: '#4a6e6a', borderRadius: '5px', padding: '2px 8px' }}>
+                      {q.question_type === 'ar' ? 'Assertion & Reason' : q.question_type?.toUpperCase()}
+                    </span>
+                    {q.marks && <span style={{ fontSize: '12px', color: '#6b8a80' }}>{q.marks} marks</span>}
+                    <span style={{ fontSize: '12px', color: '#aaa', marginLeft: 'auto' }}>Q{q.question_number || i + 1}</span>
+                  </div>
+                  <p style={{ fontSize: '14px', color: '#2c3e3a', margin: 0, whiteSpace: 'pre-wrap' }}>{q.question_text}</p>
+                  {q.has_diagram && q.paper_pdf_url && (
+                    <a
+                      href={q.paper_pdf_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '6px', marginTop: '10px',
+                        padding: '6px 14px', borderRadius: '7px', fontSize: '12px', fontWeight: '600',
+                        background: '#fff4e0', border: '1px solid #f0a830', color: '#b97000', textDecoration: 'none'
+                      }}
+                    >
+                      View Original Paper — Q{q.question_number || i + 1}
+                    </a>
+                  )}
+                  {q.correct_answer && (
+                    <p style={{ fontSize: '13px', color: '#5a8a7a', marginTop: '8px', marginBottom: 0 }}>
+                      <strong>Answer:</strong> {q.correct_answer}
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="form-panel">
         <div className="form-group">

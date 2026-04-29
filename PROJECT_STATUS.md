@@ -1,172 +1,76 @@
-# XamBuddy Project Status Report
-**Last Updated**: April 15, 2026
-
-## 📋 Project Overview
-XamBuddy is an educational platform with FastAPI backend and dual frontend interfaces (Admin Dashboard + Student Panel) connected to PostgreSQL database.
+# XamBuddy Project Status
+**Last Updated**: April 29, 2026
 
 ---
 
-## ✅ **COMPLETED FEATURES**
-
-### **🔧 Backend Infrastructure**
-- ✅ **FastAPI Server** (`main.py`) with async PostgreSQL connection
-- ✅ **Database Model** (`database.py`) with SQLAlchemy async configuration  
-- ✅ **PostgreSQL Connection** to `139.59.93.35:5432/xambuddydb`
-- ✅ **607+ Real Questions** in database with proper schema
-- ✅ **API Endpoints**: `/`, `/student`, `/api/retrieve`, `/api/generate`, `/api/health`, `/api/subjects`, `/api/chapters/{board}/{subject}`, `/api/questions`
-
-### **🎯 Admin Dashboard** (`index.html`)
-- ✅ **Two-Column Layout**: PDF Generation (left) + Database Retrieval (right)
-- ✅ **PDF Upload**: Drag & drop interface with file validation
-- ✅ **6 Form Fields**: Exam, Subject, Chapter, Question Type, Difficulty, Number of Questions
-- ✅ **Generate Button**: Calls `/api/generate` endpoint
-- ✅ **Database Retrieval**: Same 6 filters + retrieve button
-- ✅ **Dynamic Chapters**: Populated from `/static/chapters.js`
-- ✅ **Real-time Output**: Questions displayed immediately after generation/retrieval
-- ✅ **Generate from Prompt**: NEW - Direct text input for AI-based question generation
-- ✅ **Form Validation**: Required fields, error handling, user feedback
-- ✅ **API Integration**: Full CRUD operations with database
-
-### **🎓 Student Panel** (`student.html`) 
-- ✅ **4-Mode Structure**: Chapter by Chapter, Quiz, Before Exam, Last-minute Sheet
-- ✅ **9-Screen Navigation**: `show()` function controls screen visibility
-- ✅ **State Management**: Global state object tracks mode, questions, progress
-- ✅ **Chapter by Chapter**: Individual MCQ study with explanations
-- ✅ **Quiz Mode**: Batch MCQs with scoring and results screen
-- ✅ **Before Exam**: Short & long answer revision mode
-- ✅ **Last-minute Sheet**: Formulas, theorems, diagrams reference
-- ✅ **2x2 MCQ Layout**: Options displayed in 2x2 grid (not horizontal)
-- ✅ **Dynamic Dropdowns**: Grade/Subject → Chapter population
-- ✅ **Real Database**: Uses actual PostgreSQL data, not sample data
-- ✅ **API Integration**: All modes connected to `/api/retrieve` endpoint
-- ✅ **Responsive Design**: Mobile-friendly with proper breakpoints
-
-### **📚 Static Assets**
-- ✅ **Chapter Data** (`/static/chapters.js`): Complete CBSE 10th/12th chapters by subject
-- ✅ **Deployment Config**: `vercel.json` for Vercel deployment
-- ✅ **Dependencies**: `requirements.txt` with all necessary packages
-
-### **🔗 Database Integration**
-- ✅ **Schema Mapping**: Correct column names (`exam`, `subject`, `chapter`, etc.)
-- ✅ **Query Optimization**: Proper filtering with `ilike`, `limit`, `shuffle`
-- ✅ **Error Handling**: Transaction rollback, proper HTTP status codes
-- ✅ **JSON Support**: JSONB column for MCQ options
-- ✅ **Real-time Data**: Live database queries, no hardcoded sample data
+## Project Overview
+XamBuddy is an educational platform for CBSE Class 10 and 12 students. The current build is an admin panel used to manage the question bank — uploading chapter PDFs and exam papers, running Claude-powered extraction and generation, and reviewing the resulting questions.
 
 ---
 
-## 🚧 **CURRENT ISSUES**
+## Architecture
 
-### **🔍 Real-time Data Not Displaying**
-**Problem**: User reports real-time data from PostgreSQL not being displayed
-**Root Cause Analysis**:
-- ✅ **Fixed**: Column name mismatch (`exam_type` vs `exam`) 
-- ✅ **Fixed**: Missing API parameters (`q_type`, `limit`, `shuffle`, `chapter`)
-- ✅ **Fixed**: Database connection and query logic
-- 🔄 **Investigating**: Potential frontend API call issues or database connectivity
-
-**Recent Fixes Applied**:
-1. **API Parameter Support**: Added `q_type`, `limit`, `shuffle`, `chapter` to `/api/retrieve`
-2. **Column Name Fix**: Changed `Question.exam_type` to `Question.exam` in queries
-3. **Shuffle Logic**: Implemented question randomization when requested
-4. **Limit Support**: Added proper query limiting functionality
+| Layer | Technology |
+|---|---|
+| Frontend | React + Vite, deployed on Vercel |
+| Backend | Python FastAPI, deployed as a Vercel serverless function (`main.py`) |
+| Database | Supabase PostgreSQL, accessed via PostgREST REST API |
+| Storage | Supabase Storage (`pdf-uploads` bucket) |
+| Auth | Supabase Auth (email/password), admin-only |
+| AI | Anthropic Claude Haiku (`claude-haiku-4-5-20251001`) |
 
 ---
 
-## 📋 **REMAINING TASKS**
+## Completed Features
 
-### **🔧 Backend Enhancements**
-- 🔄 **Debug Real-time Data**: Investigate why frontend not showing live database data
-- 🔄 **AI Integration**: Connect prompt generation to actual AI service (OpenAI/Claude)
-- 🔄 **PDF Processing**: Implement actual PDF parsing instead of simulation
-- 🔄 **Error Logging**: Add comprehensive logging for debugging
-- 🔄 **API Validation**: Add request/response validation middleware
+### Backend (`main.py`)
+- Supabase REST helpers (`_sb_get`, `_sb_post`, `_sb_patch`, `_sb_delete`)
+- Error logging to `processing_errors` table (`_log_error`)
+- Question generation from chapter PDFs: reads up to 80,000 chars, analyses practical/theory split, generates questions with Jaccard 80% similarity dedup, stores with `keywords_json` and `is_practical`
+- Chapter analysis: detects practical/theory ratio, extracts headings, stores in `chapter_meta`
+- Coverage check: after generation, auto-fills uncovered headings with 1 SA + 1 MCQ
+- Chapter title extraction from PDF first page (`/api/extract-chapter-title`)
+- Question paper extraction: extracts all questions from exam paper PDFs with type detection (MCQ, AR, VSA, SA, LA, CBQ), difficulty tagging, diagram detection
+- Answer key matching: matches answers to extracted questions by question number, handles multi-set answer keys, extracts and stores keywords
+- Reference upload registration (`reference_uploads` table)
+- Edit and delete generated questions (`PATCH`/`DELETE /api/questions/{id}`)
+- Full API endpoint list: see `docs/PROGRESS.md`
+- Split-PDF endpoints: `/api/split-pdf/preview` (chapter detection) and `/api/split-pdf/download` (ZIP stream); uses PyMuPDF font-size analysis with watermark filtering
 
-### **🎯 Admin Dashboard**
-- 🔄 **AI Service Integration**: Real question generation from prompts
-- 🔄 **PDF Upload Processing**: Actual file content extraction and parsing
-- 🔄 **Bulk Operations**: Batch question import/export
-- 🔄 **Question Editor**: Edit existing questions in database
-- 🔄 **Analytics Dashboard**: Usage statistics and metrics
-
-### **🎓 Student Panel**
-- 🔄 **Progress Tracking**: Save user progress and scores
-- 🔄 **Question Timer**: Add time tracking for quiz modes
-- 🔄 **Bookmark System**: Save favorite questions/chapters
-- 🔄 **Performance Analytics**: Individual student performance metrics
-- 🔄 **Offline Mode**: Cache questions for offline access
-
-### **🔗 Database**
-- 🔄 **Indexing**: Add database indexes for performance
-- 🔄 **Backup System**: Automated database backups
-- 🔄 **Migration Scripts**: Version-controlled schema updates
-- 🔄 **Data Validation**: Ensure data quality and consistency
-
-### **🚀 Deployment**
-- 🔄 **Environment Variables**: Secure configuration management
-- 🔄 **CI/CD Pipeline**: Automated testing and deployment
-- 🔄 **Monitoring**: Application performance and error tracking
-- 🔄 **Scaling**: Load balancing and database optimization
+### Frontend (`src/`)
+- **AdminLogin.jsx** — Supabase email/password login
+- **AdminDashboard.jsx** — Sidebar shell with 8 tabs
+- **Dashboard.jsx** — Drillable question inventory (exam → subject → chapter)
+- **GenerateQuestions.jsx** — Single PDF upload + Generate All (150 questions, 7 batches, progress bar)
+- **BulkUpload.jsx** — Bulk chapter folder upload with auto title extraction, editable chapter list, and built-in PDF splitter tool
+- **RetrieveQuestions.jsx** — Filter, view, inline-edit, and delete generated questions
+- **ExamPaperUploads.jsx** — Single and bulk exam paper + answer key uploads with filename-based auto-detection
+- **ExamPaperRetrieve.jsx** — View papers and drill into extracted questions per paper
+- **RetrieveChapterPdfs.jsx** — Browse stored chapter PDFs
+- **ErrorLog.jsx** — View processing error log
 
 ---
 
-## 🎯 **NEXT IMMEDIATE PRIORITIES**
+## Remaining Work
 
-### **🔥 High Priority**
-1. **Fix Real-time Data Display**: Debug frontend-backend connectivity
-2. **Test All API Endpoints**: Verify database integration works end-to-end
-3. **Add Error Logging**: Implement comprehensive error tracking
-4. **AI Service Integration**: Connect prompt generation to real AI
+See `docs/PROGRESS.md` for the full breakdown. High-level gaps:
 
-### **📋 Medium Priority**
-1. **PDF Processing Implementation**: Real file content extraction
-2. **User Authentication**: Add login system for progress tracking
-3. **Question Management UI**: Edit/delete existing questions
-4. **Performance Optimization**: Database queries and frontend loading
+- **Split PDF**: chapter detection is font-size heuristic based; scanned PDFs or PDFs with non-standard fonts may need threshold adjustment
+- **Schema**: `questions` table still uses combined `exam` field instead of separate `class_level`/`board`; no `times_served`/`last_served_at`
+- **Validation**: keyword count checks for SA/LA not enforced; question text `?` check not enforced
+- **UI**: no real-time step-by-step progress log for single uploads; no dedicated post-processing summary screen
+- **Integrity**: no transaction rollback (Supabase REST limitation); no re-process button in error log
+- **Student side**: not started — pricing, auth for students, content gating, practice UI (see `docs/PRICING_AND_PAYMENTS.md`)
 
 ---
 
-## 📊 **PROJECT METRICS**
+## Database Tables
 
-### **Database**
-- **Total Questions**: 607+
-- **Subjects**: 12 (Psychology, Mathematics, Physics, Chemistry, Biology, English, Hindi, History, Geography, Political Science, Economics, Computer Science)
-- **Exams**: 2 (10th CBSE Board, 12th CBSE Board)
-- **Question Types**: MCQ, Short Answer, Long Answer
-- **Difficulty Levels**: Easy, Medium, Hard
-
-### **Codebase**
-- **Backend Files**: 2 (`main.py`, `database.py`)
-- **Frontend Files**: 2 (`index.html`, `student.html`)
-- **Static Assets**: 1 (`chapters.js`)
-- **Config Files**: 2 (`requirements.txt`, `vercel.json`)
-- **Total LOC**: ~2000+ lines across all files
-
-### **API Endpoints**
-- **GET** `/`: Admin dashboard
-- **GET** `/student`: Student panel
-- **GET** `/api/retrieve`: Question retrieval with filters
-- **POST** `/api/generate-from-prompt`: AI-based question generation
-- **GET** `/api/generate`: PDF processing (simulated)
-- **GET** `/api/health`: Health check
-- **GET** `/api/subjects`: Available subjects
-- **GET** `/api/chapters/{board}/{subject}`: Chapters by exam/subject
-- **POST** `/api/questions`: Add new question
-
----
-
-## 🏁 **CONCLUSION**
-
-**Project Status**: **80% Complete** ✅
-- **Core Functionality**: ✅ Fully operational
-- **Database Integration**: ✅ Working with real data
-- **User Interfaces**: ✅ Both admin and student panels complete
-- **API Layer**: ✅ Comprehensive endpoints available
-
-**Critical Path**: Debug real-time data display issue to reach 90% completion.
-
-**Next Milestone**: AI service integration for prompt-based question generation to reach 95% completion.
-
----
-
-*This status report provides a comprehensive overview of the XamBuddy project's current state, completed features, issues, and remaining development tasks.*
+| Table | Purpose |
+|---|---|
+| `questions` | Generated questions from chapter PDFs |
+| `chapter_meta` | Chapter analysis results (practical/theory split, headings) |
+| `exam_questions` | Questions extracted from past exam papers |
+| `pdf_uploads` | Exam paper upload metadata |
+| `reference_uploads` | Guide/reference book upload metadata |
+| `processing_errors` | Backend error log |
