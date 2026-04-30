@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from typing import Optional, Literal
 import json
+import base64
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -655,6 +656,96 @@ def _parse_ai_questions_json(raw, stop_reason):
 
 # ---------- Split-PDF helpers ----------
 
+_SPLIT_WATERMARK_RE = re.compile(r'@\S+\s+NOT\s+TO\s+BE\s+\w+', re.IGNORECASE)
+_SPLIT_FRONT_MATTER_RE = re.compile(
+    r'^(foreword|preface|contents|table\s+of\s+contents|about|index|acknowledgements?|note\s+to|introduction)$',
+    re.IGNORECASE,
+)
+_SPLIT_CHAPTER_PREFIX_RE = re.compile(
+    r'^(chapter|ch\.?|unit|section|part)\s*[\d\w]+\.?\s*', re.IGNORECASE
+)
+
+
+def _split_detect_body_font_size(doc) -> float:
+    from collections import Counter as _C
+    w: _C = _C()
+    for i in range(min(len(doc), 30)):
+        for block in doc[i].get_text("dict")["blocks"]:
+            if block["type"] != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span["text"].strip()
+                    if not text or not _is_english(text):
+                        continue  # Only use English text to calibrate body size
+                    n = len(text)
+                    if n > 0:
+                        w[round(span["size"], 1)] += n
+    return w.most_common(1)[0][0] if w else 12.0
+
+
+def _split_page_heading(page, body_size: float, threshold: float = 1.4):
+    """Return the chapter title if this page starts a new chapter, else None."""
+    top_y = page.rect.height * 0.65
+    min_size = body_size * threshold
+    bold_min = body_size * 1.1
+    parts = []
+    found = False
+    blocks = sorted(
+        page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"],
+        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],
+    )
+    for block in blocks:
+        if block["type"] != 0:
+            continue
+        if block["bbox"][1] > top_y:
+            break
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span["text"].strip()
+                if not text:
+                    continue
+                size = span["size"]
+                is_bold = bool(span["flags"] & 16)
+                if size >= min_size or (is_bold and size >= bold_min):
+                    clean = _SPLIT_WATERMARK_RE.sub('', text).strip()
+                    if clean and _is_english(clean) and any(c.isalpha() for c in clean):
+                        parts.append(clean)
+                    found = True
+    if not found or not parts:
+        return None
+    raw = " ".join(parts).strip()
+    if len(raw) < 2 or _SPLIT_FRONT_MATTER_RE.match(raw):
+        return None
+    stripped = _SPLIT_CHAPTER_PREFIX_RE.sub('', raw).strip()
+    return stripped if stripped else raw
+
+
+def _split_find_chapters_by_font(doc, threshold: float = 1.4) -> list:
+    """Detect chapter boundaries by finding pages with large/bold English headings."""
+    from collections import Counter as _C
+    body_size = _split_detect_body_font_size(doc)
+    raw: list = []
+    for i in range(len(doc)):
+        if not _split_page_has_english_content(doc[i]):
+            continue  # Skip pages with no English text
+        title = _split_page_heading(doc[i], body_size, threshold)
+        if title:
+            raw.append((i + 1, title))   # 1-based physical page
+    # Drop headers that repeat on every page
+    counts = _C(t for _, t in raw)
+    raw = [(p, t) for p, t in raw if counts[t] < 3]
+    # Merge consecutive pages (multi-line headings)
+    merged: list = []
+    for page, title in raw:
+        if merged and page - merged[-1][0] <= 1:
+            prev_p, prev_t = merged[-1]
+            combined = (prev_t + " " + title) if prev_t not in title else prev_t
+            merged[-1] = (prev_p, combined.strip())
+        else:
+            merged.append((page, title))
+    return [{"title": t, "printed_page": p} for p, t in merged]
+
 def _split_extract_subject_name(filename: str) -> str:
     from pathlib import Path as _Path
     stem = _Path(filename).stem
@@ -680,7 +771,7 @@ def _split_page_text_by_lines(page) -> str:
     from collections import defaultdict
     lines: dict = defaultdict(list)
     for (x0, y0, x1, y1, word, *_) in words:
-        line_key = round(y0 / 4) * 4  # 4pt bucket — groups words on the same line
+        line_key = round(y0 / 10) * 10  # 10pt bucket — tolerates baseline variation on same line
         lines[line_key].append((x0, word))
     result = []
     for y_key in sorted(lines.keys()):
@@ -689,62 +780,562 @@ def _split_page_text_by_lines(page) -> str:
     return "\n".join(result)
 
 
+def _is_english(text: str) -> bool:
+    """True if the text contains only ASCII characters (no Kannada/other scripts)."""
+    return all(ord(c) < 128 for c in text)
+
+
+_NUM_END_RE = re.compile(r'(\d{1,4})\s*$')
+_JUNK_LINE_RE = re.compile(r'^[\d\s\.\-]+$')
+
+
+def _split_toc_page_score(text: str) -> int:
+    """Count lines that end in a number — works for any language."""
+    return sum(
+        1 for line in text.splitlines()
+        if len(line.strip()) > 4 and _NUM_END_RE.search(line.strip())
+        and not _JUNK_LINE_RE.match(line.strip())
+    )
+
+
+def _split_page_numbers_from_toc(text: str) -> list:
+    """Extract page numbers (any language titles) from a TOC page, sorted."""
+    nums = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) < 3:
+            continue
+        m = _NUM_END_RE.search(line)
+        if m and not _JUNK_LINE_RE.match(line):
+            n = int(m.group(1))
+            if 1 <= n <= 9999:
+                nums.add(n)
+    return sorted(nums)
+
+
+def _split_english_title_from_page(page) -> str:
+    """Find the largest English text in the top 60% of a page (chapter title)."""
+    top_y = page.rect.height * 0.6
+    blocks = sorted(
+        page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"],
+        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],
+    )
+    best_size, best_text = 0.0, ""
+    for block in blocks:
+        if block["type"] != 0:
+            continue
+        if block["bbox"][1] > top_y:
+            break
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                raw = span["text"].strip()
+                if not raw or not any(c.isalpha() for c in raw):
+                    continue
+                clean = _SPLIT_WATERMARK_RE.sub("", raw).strip()
+                if not clean or not _is_english(clean) or len(clean) < 3:
+                    continue
+                if span["size"] > best_size:
+                    best_size = span["size"]
+                    best_text = clean
+    stripped = _SPLIT_CHAPTER_PREFIX_RE.sub("", best_text).strip()
+    return stripped or best_text
+
+
+def _split_find_toc_page(doc, sample: int = 25) -> tuple:
+    """
+    Pick the early page with the most lines ending in a number (any language).
+    Returns (0-based index, text, score, per-page scores).
+    """
+    best_idx, best_score, best_text = 0, 0, ""
+    counts = []
+    for i in range(min(len(doc), sample)):
+        word_text = _split_page_text_by_lines(doc[i]).strip()
+        raw_text = doc[i].get_text("text").strip()
+        text = word_text if len(word_text) >= len(raw_text) else raw_text
+        score = _split_toc_page_score(text)
+        counts.append(score)
+        if score > best_score:
+            best_score, best_idx, best_text = score, i, text
+    print(f"[split-toc] scores/page: {counts}", flush=True)
+    print(f"[split-toc] best=pg{best_idx+1}(score={best_score})", flush=True)
+    return best_idx, best_text, best_score, counts
+
+
 def _split_extract_toc_from_pdf(doc, claude_api_key: str) -> dict:
     """
-    Send the first 35 pages to Claude to identify:
-      - contents_physical_page: 1-based physical page of the Contents/Index page
-      - chapters: [{title, printed_page}] — one entry per chapter, verbatim from Contents
+    Extract chapter list from PDF. Three attempts in order:
+      1. Embedded PDF bookmarks (doc.get_toc()) — most reliable
+      2. Text scan: find page with most title+page-number pairs (any language)
+      3. Font-size detection: look for visually prominent chapter headings
+      If all three fail, raises ValueError with a screenshot-fallback instruction.
 
-    The rule: page immediately after the Contents page = book page 1.
-    So for any chapter with printed_page N:
-      fitz_index (0-based) = contents_physical_page + N - 1
+    Return format: {"contents_physical_page": int, "chapters": [{title, printed_page}]}
+    When using embedded bookmarks, contents_physical_page=0 and printed_page=physical page (1-based).
+    fitz_index (0-based) = contents_physical_page + printed_page - 1  (works for all cases)
     """
-    pages_text = []
-    sample = min(len(doc), 35)
-    for i in range(sample):
-        text = _split_page_text_by_lines(doc[i]).strip()
-        if text:
-            pages_text.append(f"=== Physical page {i + 1} ===\n{text[:2500]}")
-    combined = "\n\n".join(pages_text)
+    # ── 1. Embedded bookmarks ──────────────────────────────────────────────
+    try:
+        embedded = doc.get_toc(simple=True)  # [(level, title, page_1based), ...]
+        # Keep only English titles; try every level and pick the one with most entries
+        best_bm: list = []
+        seen_levels = sorted({lv for lv, t, p in embedded})
+        for lv in seen_levels:
+            entries = [{"title": t.strip(), "printed_page": p}
+                       for lv2, t, p in embedded
+                       if lv2 == lv and p > 0 and t.strip() and _is_english(t.strip())]
+            if len(entries) > len(best_bm):
+                best_bm = entries
+        if len(best_bm) >= 2:
+            print(f"[split-toc] embedded TOC: {len(best_bm)} English entries", flush=True)
+            return {"contents_physical_page": 0, "chapters": best_bm}
+    except Exception as e:
+        print(f"[split-toc] embedded TOC failed: {e}", flush=True)
 
-    prompt = f"""You are analysing a textbook PDF. Text from the first {sample} physical pages is below.
-"Physical page" = 1-based position in the PDF file.
+    # ── 2. Text scan — any language TOC ───────────────────────────────────
+    toc_idx, toc_text, toc_score, all_counts = _split_find_toc_page(doc, sample=25)
+    contents_physical_page = toc_idx + 1  # 1-based
 
-TASK:
-1. Find the Contents / Index page — the page that lists ALL chapter names with their starting page numbers.
-2. Note its physical page number (e.g. if it says "=== Physical page 5 ===" above it, that is 5).
-3. Extract ONE entry per chapter — title verbatim from Contents, and the printed page number on that line.
-   Include Answers / Solutions / Answer Key if listed.
+    if toc_score == 0:
+        raise ValueError(
+            "Could not find a Contents page automatically. "
+            "Use the screenshot fallback: take a screenshot of the Contents/Index page, "
+            "upload it below, and enter the PDF page number of that Contents page."
+        )
 
-Return ONLY valid JSON:
-{{
-  "contents_physical_page": <int>,
-  "chapters": [
-    {{"title": "exact title from contents", "printed_page": <int>}},
-    ...
-  ]
-}}
+    if toc_score >= 2:
+        page_nums = _split_page_numbers_from_toc(toc_text)
+        print(f"[split-toc] TOC page numbers: {page_nums}", flush=True)
+        if len(page_nums) >= 2:
+            chapters = []
+            for i, pg in enumerate(page_nums):
+                # Look up English title from the actual chapter start page
+                phys_idx = contents_physical_page + pg - 1  # 0-based fitz index
+                eng_title = ""
+                if 0 <= phys_idx < len(doc):
+                    eng_title = _split_english_title_from_page(doc[phys_idx])
+                title = eng_title if eng_title else f"Chapter {i + 1}"
+                chapters.append({"title": title, "printed_page": pg})
+            print(f"[split-toc] resolved chapters: {chapters[:4]}", flush=True)
+            return {"contents_physical_page": contents_physical_page, "chapters": chapters}
 
-Rules:
-- contents_physical_page: the physical page number of the Contents page itself.
-- One chapter object per line in the Contents — never group multiple chapters.
-- Copy titles exactly as written. Do not include the Contents page, title page, or foreword as chapters.
-- If no Contents page found: {{"error": "No contents page found"}}
+    # ── 3. Font-size based detection (for PDFs with Kannada/no-English TOC) ──
+    print(f"[split-toc] text scan insufficient (score={toc_score}) — trying font-size detection", flush=True)
+    try:
+        font_chapters = _split_find_chapters_by_font(doc)
+        print(f"[split-toc] font detection: {len(font_chapters)} chapters: {font_chapters[:4]}", flush=True)
+        if len(font_chapters) >= 2:
+            return {"contents_physical_page": 0, "chapters": font_chapters}
+    except Exception as e:
+        print(f"[split-toc] font detection failed: {e}", flush=True)
 
-PDF TEXT:
-{combined}"""
+    # Automatic detection failed — give user an actionable error
+    raise ValueError(
+        "Could not find a Contents page automatically (PDF may have a non-English or scanned index). "
+        "Use the screenshot fallback: take a screenshot of the Contents/Index page, "
+        "upload it below, and enter the PDF page number of that Contents page."
+    )
 
-    client = anthropic.Anthropic(api_key=claude_api_key)
+
+def _split_normalize_chapters(chapters: list) -> list:
+    cleaned = []
+    for ch in chapters or []:
+        try:
+            title = str(ch.get("title", "")).strip()
+            printed_page = int(ch.get("printed_page"))
+        except Exception:
+            continue
+        if title and printed_page >= 1:
+            cleaned.append({"title": title, "printed_page": printed_page})
+    return sorted(cleaned, key=lambda ch: ch["printed_page"])
+
+
+def _split_page_has_english_content(page) -> bool:
+    text = page.get_text("text") or ""
+    ascii_letters = sum(1 for c in text if ("a" <= c.lower() <= "z"))
+    non_ascii_letters = sum(1 for c in text if ord(c) > 127 and c.isalpha())
+    if ascii_letters < 8:
+        return False
+    return ascii_letters >= max(8, non_ascii_letters)
+
+
+def _split_margin_page_number(page) -> Optional[int]:
+    """Read the visible printed page number from top/bottom page margins."""
+    words = page.get_text("words")
+    if not words:
+        return None
+    height = page.rect.height
+    width = page.rect.width
+    candidates = []
+    for x0, y0, x1, y1, word, *_ in words:
+        token = re.sub(r"[^\d]", "", word.strip())
+        if not token or not re.fullmatch(r"\d{1,4}", token):
+            continue
+        num = int(token)
+        if num < 1 or num > 9999:
+            continue
+        cy = (y0 + y1) / 2
+        cx = (x0 + x1) / 2
+        in_top = cy <= height * 0.12
+        in_bottom = cy >= height * 0.86
+        if not in_top and not in_bottom:
+            continue
+        edge_distance = min(cy, height - cy)
+        center_bias = abs(cx - (width / 2)) / max(width, 1)
+        candidates.append((edge_distance + center_bias * 10, num))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def _split_normalize_title_text(text: str) -> str:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _split_title_tokens(title: str) -> list:
+    stop = {"a", "an", "and", "the", "of", "in", "on", "to", "for", "with", "is", "are"}
+    normalized = _split_normalize_title_text(title)
+    return [w for w in normalized.split() if len(w) >= 3 and w not in stop]
+
+
+def _split_page_title_score(page, title: str) -> int:
+    tokens = _split_title_tokens(title)
+    if not tokens:
+        return 0
+    text = _split_normalize_title_text(page.get_text("text") or "")
+    if not text:
+        return 0
+    phrase = " ".join(tokens)
+    score = 0
+    if phrase and phrase in text:
+        score += len(tokens) * 3
+    score += sum(1 for token in tokens if token in text.split())
+    return score
+
+
+def _split_find_chapter_starts_by_title(doc, chapters: list) -> dict:
+    """
+    Find physical PDF pages from English chapter titles. This is more reliable
+    than page numbers when opener pages omit the number or use decorative text.
+    """
+    starts = {}
+    search_from = 0
+    for ch in chapters:
+        tokens = _split_title_tokens(ch["title"])
+        if not tokens:
+            continue
+        min_score = max(2, min(len(tokens), 4))
+        best = None
+        upper = len(doc)
+        for idx in range(search_from, upper):
+            if not _split_page_has_english_content(doc[idx]):
+                continue
+            score = _split_page_title_score(doc[idx], ch["title"])
+            if score >= min_score:
+                best = (idx, score)
+                break
+        if best:
+            starts[ch["printed_page"]] = best[0]
+            search_from = best[0] + 1
+    print(f"[split-title-starts] {starts}", flush=True)
+    return starts
+
+
+def _split_find_contents_page_from_chapters(doc, chapters: list, sample: int = 20) -> Optional[int]:
+    """Find the physical PDF page that contains the screenshot-derived contents table."""
+    chapter_tokens = []
+    for ch in chapters:
+        tokens = _split_title_tokens(ch["title"])
+        if tokens:
+            chapter_tokens.append((tokens, str(ch["printed_page"])))
+    if not chapter_tokens:
+        return None
+
+    best_idx = None
+    best_score = 0
+    for idx in range(min(len(doc), sample)):
+        text = _split_normalize_title_text(doc[idx].get_text("text") or "")
+        if not text:
+            continue
+        words = set(text.split())
+        score = 0
+        for tokens, page_num in chapter_tokens:
+            token_hits = sum(1 for token in tokens if token in words)
+            if token_hits >= max(1, min(2, len(tokens))):
+                score += token_hits * 2
+            if re.search(rf"\b{re.escape(page_num)}\b", text):
+                score += 1
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    min_score = max(4, min(12, len(chapter_tokens) * 2))
+    if best_idx is not None and best_score >= min_score:
+        print(f"[split-contents-page] matched physical page {best_idx + 1} score={best_score}", flush=True)
+        return best_idx + 1
+    print(f"[split-contents-page] no confident match; best={best_idx} score={best_score}", flush=True)
+    return None
+
+
+def _split_pixmap_luma(pix, x: int, y: int) -> int:
+    x = max(0, min(pix.width - 1, int(x)))
+    y = max(0, min(pix.height - 1, int(y)))
+    channels = pix.n
+    color_channels = channels - (1 if pix.alpha else 0)
+    pos = (y * pix.width + x) * channels
+    samples = pix.samples
+    if color_channels <= 1:
+        return samples[pos]
+    return int((samples[pos] * 0.299) + (samples[pos + 1] * 0.587) + (samples[pos + 2] * 0.114))
+
+
+def _split_pixmap_ink_bbox(pix) -> tuple:
+    step = max(1, min(pix.width, pix.height) // 240)
+    min_x, min_y = pix.width, pix.height
+    max_x, max_y = 0, 0
+    ink_count = 0
+    for y in range(0, pix.height, step):
+        for x in range(0, pix.width, step):
+            if _split_pixmap_luma(pix, x, y) < 245:
+                min_x, min_y = min(min_x, x), min(min_y, y)
+                max_x, max_y = max(max_x, x), max(max_y, y)
+                ink_count += 1
+    if ink_count < 8:
+        return (0, 0, pix.width - 1, pix.height - 1)
+    pad_x = int((max_x - min_x + 1) * 0.08)
+    pad_y = int((max_y - min_y + 1) * 0.08)
+    return (
+        max(0, min_x - pad_x),
+        max(0, min_y - pad_y),
+        min(pix.width - 1, max_x + pad_x),
+        min(pix.height - 1, max_y + pad_y),
+    )
+
+
+def _split_pixmap_ink_grid(pix, grid: int = 28) -> list:
+    if pix.alpha:
+        pix = fitz.Pixmap(pix, 0)
+    x0, y0, x1, y1 = _split_pixmap_ink_bbox(pix)
+    width = max(1, x1 - x0 + 1)
+    height = max(1, y1 - y0 + 1)
+    values = []
+    sample_offsets = (0.25, 0.5, 0.75)
+    for gy in range(grid):
+        for gx in range(grid):
+            ink = 0.0
+            samples = 0
+            for oy in sample_offsets:
+                for ox in sample_offsets:
+                    x = x0 + ((gx + ox) / grid) * width
+                    y = y0 + ((gy + oy) / grid) * height
+                    ink += max(0, 245 - _split_pixmap_luma(pix, x, y)) / 245
+                    samples += 1
+            values.append(ink / samples)
+    return values
+
+
+def _split_cosine_similarity(a: list, b: list) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _split_contents_text_match_ratio(page, chapters: list) -> float:
+    text = _split_normalize_title_text(page.get_text("text") or "")
+    if not text:
+        return 0.0
+    words = set(text.split())
+    possible = 0
+    hits = 0
+    for ch in chapters:
+        tokens = _split_title_tokens(ch["title"])
+        if not tokens:
+            continue
+        possible += len(tokens) + 1
+        hits += sum(1 for token in tokens if token in words)
+        if re.search(rf"\b{re.escape(str(ch['printed_page']))}\b", text):
+            hits += 1
+    return hits / possible if possible else 0.0
+
+
+def _split_find_contents_page_from_image(doc, image_bytes: bytes, chapters: list, sample: int = 40) -> Optional[int]:
+    """
+    Visually match the uploaded contents screenshot against rendered PDF pages.
+    This works even when the PDF page-number text is inconsistent or absent.
+    Returns None if no confident match found (caller falls back to user-provided value).
+    """
+    # Load screenshot — try PNG then JPEG then raw Pixmap constructor
+    screenshot_pix = None
+    for fmt in ("png", "jpg", None):
+        try:
+            if fmt is not None:
+                img_doc = fitz.open(stream=image_bytes, filetype=fmt)
+            else:
+                img_doc = fitz.open(stream=image_bytes)
+            screenshot_pix = img_doc[0].get_pixmap(matrix=fitz.Matrix(0.5, 0.5), colorspace=fitz.csRGB, alpha=False)
+            img_doc.close()
+            break
+        except Exception:
+            pass
+    if screenshot_pix is None:
+        try:
+            screenshot_pix = fitz.Pixmap(image_bytes)
+        except Exception as e:
+            print(f"[split-contents-visual] screenshot decode failed: {e}", flush=True)
+            return None
+    screenshot_grid = _split_pixmap_ink_grid(screenshot_pix)
+    best = None
+    sample_size = min(len(doc), sample)
+    for idx in range(sample_size):
+        try:
+            page_pix = doc[idx].get_pixmap(matrix=fitz.Matrix(0.55, 0.55), colorspace=fitz.csRGB, alpha=False)
+            visual = _split_cosine_similarity(screenshot_grid, _split_pixmap_ink_grid(page_pix))
+            text = _split_contents_text_match_ratio(doc[idx], chapters)
+            combined = (visual * 0.82) + (text * 0.18)
+            if best is None or combined > best["combined"]:
+                best = {"idx": idx, "visual": visual, "text": text, "combined": combined}
+        except Exception as e:
+            print(f"[split-contents-visual] page {idx + 1} failed: {e}", flush=True)
+    if not best:
+        return None
+    print(
+        f"[split-contents-visual] best physical page {best['idx'] + 1} "
+        f"visual={best['visual']:.3f} text={best['text']:.3f} combined={best['combined']:.3f}",
+        flush=True,
+    )
+    # Require minimum confidence — a very low score means no real match was found
+    if best["combined"] < 0.15:
+        print(f"[split-contents-visual] confidence too low ({best['combined']:.3f}), ignoring visual match", flush=True)
+        return None
+    return best["idx"] + 1
+
+
+def _split_extract_chapters_from_image_bytes(img_bytes: bytes, media_type: str) -> list:
+    img_b64 = base64.b64encode(img_bytes).decode()
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2000,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                {"type": "text", "text": (
+                    "This is a screenshot of a textbook Contents or Index page. "
+                    "The book may be bilingual (e.g., Kannada + English, Hindi + English) or in any language.\n\n"
+                    "Task: for every chapter or section line, extract the title and the PAGE NUMBER at the end of the line.\n\n"
+                    "Return ONLY valid JSON, no markdown fences:\n"
+                    '{"chapters": [{"title": "Chapter Title", "printed_page": 1}, ...]}\n\n'
+                    "Critical rules:\n"
+                    "1. PAGE NUMBER is always the Arabic numeral (1, 2, 3…) at the RIGHT/END of each line — NOT the chapter number at the start\n"
+                    "2. If the line looks like: '3. Chapter Name ......... 45' → printed_page is 45, not 3\n"
+                    "3. If both a Kannada/regional title and an English title are on the same line, use the English one\n"
+                    "4. If only a non-English title is present, use it as-is (transliterate if possible)\n"
+                    "5. Include all main chapters plus Answers/Solutions/Activities sections if listed\n"
+                    "6. Skip: Foreword, Preface, Publisher info, roman-numeral page entries\n"
+                    "7. printed_page must be a positive integer — skip lines where you cannot confidently read the number\n"
+                    "8. These are TEXTBOOK printed page numbers, not PDF physical page positions"
+                )}
+            ]
+        }],
     )
     raw = response.content[0].text.strip()
+    # Strip markdown code fences if Claude wrapped the response
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("`").strip()
     start, end = raw.find("{"), raw.rfind("}") + 1
     if start == -1 or end <= start:
-        raise ValueError(f"Claude returned non-JSON: {raw[:300]}")
-    return json.loads(raw[start:end])
+        raise ValueError(f"Could not parse Claude response: {raw[:200]}")
+    data = json.loads(raw[start:end])
+    chapters = _split_normalize_chapters(data.get("chapters", []))
+    if not chapters:
+        raise ValueError("No chapters found in the screenshot.")
+    return chapters
+
+
+def _split_detect_printed_page_map(doc) -> dict:
+    """
+    Map printed textbook page numbers to physical PDF indexes.
+    Front matter and non-English pages are ignored. If a chapter opener omits
+    its page number, infer it from the next visible number, e.g. visible page 2
+    means the previous physical page is printed page 1.
+    """
+    raw = []
+    for idx in range(len(doc)):
+        if not _split_page_has_english_content(doc[idx]):
+            continue
+        page_num = _split_margin_page_number(doc[idx])
+        if page_num is not None:
+            raw.append((idx, page_num))
+    anchors = [
+        (idx - (page_num - 1), idx, page_num)
+        for idx, page_num in raw
+        if 1 <= page_num <= 10 and idx - (page_num - 1) >= 0
+    ]
+    if not anchors:
+        return {}
+    # Prefer the earliest plausible printed page 1. This handles books where
+    # page 1 itself has no number but page 2/3 does.
+    start_idx, anchor_idx, anchor_num = sorted(anchors, key=lambda item: (item[0], item[2]))[0]
+    page_map = {}
+    for printed_page in range(1, len(doc) - start_idx + 1):
+        page_map[printed_page] = start_idx + printed_page - 1
+    for idx, page_num in raw:
+        expected_idx = start_idx + page_num - 1
+        if idx >= start_idx and abs(idx - expected_idx) <= 1:
+            page_map[page_num] = idx
+    print(
+        f"[split-pages] anchor printed page {anchor_num} at pdf index {anchor_idx}; "
+        f"inferred page 1 at pdf index {start_idx}; map: {list(page_map.items())[:12]}",
+        flush=True,
+    )
+    return page_map
+
+
+def _split_resolve_ranges(doc, chapters: list, contents_physical_page: int, force_contents_mapping: bool = False) -> list:
+    page_map = {} if force_contents_mapping else _split_detect_printed_page_map(doc)
+    title_starts = {} if force_contents_mapping else _split_find_chapter_starts_by_title(doc, chapters)
+    total_pages = len(doc)
+    ranges = []
+    for i, ch in enumerate(chapters):
+        current_printed = ch["printed_page"]
+        next_printed = chapters[i + 1]["printed_page"] if i + 1 < len(chapters) else None
+        fallback_start = contents_physical_page + current_printed - 1
+        fitz_start = title_starts.get(current_printed, page_map.get(current_printed, fallback_start))
+        if next_printed is not None:
+            fallback_next_start = fitz_start + max(1, next_printed - current_printed)
+            next_start = title_starts.get(next_printed, page_map.get(next_printed, fallback_next_start))
+            fitz_end = next_start - 1
+            end_printed = next_printed - 1
+        else:
+            later_labels = [n for n in page_map.keys() if n > current_printed]
+            if later_labels:
+                fitz_end = page_map[min(later_labels)] - 1
+                end_printed = min(later_labels) - 1
+            else:
+                fitz_end = total_pages - 1
+                end_printed = current_printed + max(0, fitz_end - fitz_start)
+        fitz_start = max(0, min(fitz_start, total_pages - 1))
+        fitz_end = max(fitz_start, min(fitz_end, total_pages - 1))
+        ranges.append({
+            "title": ch["title"],
+            "printed_page": current_printed,
+            "end_printed_page": end_printed,
+            "fitz_start": fitz_start,
+            "fitz_end": fitz_end,
+            "pages": fitz_end - fitz_start + 1,
+            "used_printed_page_map": bool(page_map),
+            "used_title_start": current_printed in title_starts,
+            "used_contents_page_anchor": force_contents_mapping,
+        })
+    return ranges
 
 # ---------- API endpoints ----------
 
@@ -820,6 +1411,8 @@ async def generate_from_pdf(
     chapter: str = Form(...),
     chapter_order: Optional[int] = Form(None),
     title_edited: bool = Form(False),
+    answers_file: Optional[UploadFile] = File(None),
+    answers_file_2: Optional[UploadFile] = File(None),
 ):
     if not CLAUDE_API_KEY:
         raise HTTPException(status_code=500, detail="Claude API key not configured")
@@ -839,6 +1432,18 @@ async def generate_from_pdf(
         raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
     full_text = truncate_text(text, 80000)
+
+    # Extract answers PDF text if provided (state board textbooks)
+    answers_text = ""
+    for af in [answers_file, answers_file_2]:
+        if af is not None:
+            try:
+                af_content = await af.read()
+                af_text = extract_text(af_content)
+                if af_text.strip():
+                    answers_text += af_text + "\n\n"
+            except Exception:
+                pass
 
     # Consistency check: verify chapter name matches PDF content
     # Skipped if the admin manually edited/confirmed the title — their input is authoritative
@@ -913,6 +1518,15 @@ OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
 
 CHAPTER CONTENT:
 {full_text}"""
+
+    if answers_text.strip():
+        prompt += (
+            f"\n\nEXERCISE ANSWERS (from the textbook's answers/solutions section):\n"
+            f"{truncate_text(answers_text, 20000)}\n\n"
+            "ANSWERS USAGE RULE: The above answers section contains the official textbook answers. "
+            "For every exercise question you generate, ensure its answer matches the corresponding answer in this section. "
+            "Use the same numerical values, steps, and final answer as given. Do not invent different answers."
+        )
 
     if existing_questions:
         prompt += "\n\nDO NOT repeat or closely paraphrase any of these existing questions:\n" + "\n".join(f"- {q}" for q in existing_questions)
@@ -1531,7 +2145,13 @@ async def get_chapters(
 
 
 @app.post("/api/split-pdf/preview")
-async def split_pdf_preview(file: UploadFile = File(...)):
+async def split_pdf_preview(
+    file: UploadFile = File(...),
+    toc_image: Optional[UploadFile] = File(None),
+    chapters_json: Optional[str] = Form(None),
+    contents_physical_page: Optional[int] = Form(None),
+    anchor_mode: Optional[str] = Form(None),
+):
     if not _FITZ_AVAILABLE:
         raise HTTPException(status_code=500, detail="PyMuPDF not installed. Run: pip install PyMuPDF")
     if not CLAUDE_API_KEY:
@@ -1542,37 +2162,85 @@ async def split_pdf_preview(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
     total_pages = len(doc)
-    try:
-        toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
-    except Exception as e:
-        doc.close()
-        raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
-    doc.close()
-    if "error" in toc:
-        return JSONResponse(status_code=422, content={"error": toc["error"]})
-    chapters = toc.get("chapters", [])
+    if toc_image is not None:
+        try:
+            img_bytes = await toc_image.read()
+            chapters = _split_extract_chapters_from_image_bytes(img_bytes, toc_image.content_type or "image/png")
+            # If user explicitly provided the Contents page number, trust it — skip slow visual search
+            if contents_physical_page is not None and contents_physical_page > 0:
+                final_cp = contents_physical_page
+            else:
+                detected_cp = _split_find_contents_page_from_image(doc, img_bytes, chapters)
+                if detected_cp is None:
+                    detected_cp = _split_find_contents_page_from_chapters(doc, chapters)
+                final_cp = detected_cp if detected_cp is not None else 1
+            toc = {
+                "contents_physical_page": final_cp,
+                "chapters": chapters,
+            }
+            anchor_mode = "contents_page"
+        except Exception as e:
+            doc.close()
+            raise HTTPException(status_code=422, detail=str(e))
+    elif chapters_json:
+        try:
+            chapters = json.loads(chapters_json)
+            cp = contents_physical_page
+            if cp is None and anchor_mode == "contents_page":
+                detected_cp = _split_find_contents_page_from_chapters(doc, _split_normalize_chapters(chapters))
+                if detected_cp is not None:
+                    cp = detected_cp
+            toc = {
+                "contents_physical_page": cp if cp is not None else 1,
+                "chapters": chapters,
+            }
+        except Exception:
+            doc.close()
+            raise HTTPException(status_code=400, detail="Invalid chapters_json")
+    else:
+        try:
+            toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
+        except Exception as e:
+            doc.close()
+            raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
+        if "error" in toc:
+            msg = toc["error"]
+            if "_debug" in toc:
+                msg += " | " + toc["_debug"]
+            doc.close()
+            return JSONResponse(status_code=422, content={"error": msg})
+        chapters = toc.get("chapters", [])
+    chapters = _split_normalize_chapters(chapters)
     if not chapters:
+        doc.close()
         return JSONResponse(status_code=422, content={"error": "No chapters found in table of contents."})
-    # contents_physical_page is 1-based.
-    # Rule: page immediately after Contents = book page 1.
-    # fitz 0-based index of book page N = contents_physical_page + N - 1
     cp = toc.get("contents_physical_page", 1)
-    result = []
-    for i, ch in enumerate(chapters):
-        fitz_start = cp + ch["printed_page"] - 1
-        fitz_end = (cp + chapters[i + 1]["printed_page"] - 2) if i + 1 < len(chapters) else total_pages - 1
-        result.append({
-            "title": ch["title"],
-            "printed_page": ch["printed_page"],
-            "end_printed_page": chapters[i + 1]["printed_page"] - 1 if i + 1 < len(chapters) else total_pages - cp,
-            "pages": fitz_end - fitz_start + 1,
-        })
+    result = _split_resolve_ranges(doc, chapters, cp, force_contents_mapping=(anchor_mode == "contents_page"))
+    doc.close()
     subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
     return {"subject_name": subject_name, "total_pages": total_pages, "contents_physical_page": cp, "chapters": result}
 
 
+@app.post("/api/split-pdf/toc-from-image")
+async def split_pdf_toc_from_image(image: UploadFile = File(...)):
+    """Extract chapter titles + page numbers from a screenshot of the TOC page using Claude vision."""
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
+    img_bytes = await image.read()
+    try:
+        chapters = _split_extract_chapters_from_image_bytes(img_bytes, image.content_type or "image/png")
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {"chapters": chapters}
+
+
 @app.post("/api/split-pdf/download")
-async def split_pdf_download(file: UploadFile = File(...)):
+async def split_pdf_download(
+    file: UploadFile = File(...),
+    chapters_json: Optional[str] = Form(None),
+    contents_physical_page: Optional[int] = Form(None),
+    anchor_mode: Optional[str] = Form(None),
+):
     if not _FITZ_AVAILABLE:
         raise HTTPException(status_code=500, detail="PyMuPDF not installed.")
     if not CLAUDE_API_KEY:
@@ -1583,32 +2251,39 @@ async def split_pdf_download(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
     total_pages = len(doc)
-    try:
-        toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
-    except Exception as e:
-        doc.close()
-        raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
-    if "error" in toc:
-        doc.close()
-        raise HTTPException(status_code=422, detail=toc["error"])
-    chapters = toc.get("chapters", [])
+    # Use caller-supplied chapters (from image extraction) if provided
+    if chapters_json:
+        try:
+            chapters = json.loads(chapters_json)
+            # Trust the caller-supplied contents_physical_page directly — no re-detection needed
+            cp = contents_physical_page if contents_physical_page is not None else 1
+        except Exception:
+            doc.close()
+            raise HTTPException(status_code=400, detail="Invalid chapters_json")
+    else:
+        try:
+            toc = _split_extract_toc_from_pdf(doc, CLAUDE_API_KEY)
+        except Exception as e:
+            doc.close()
+            raise HTTPException(status_code=422, detail=f"TOC extraction failed: {e}")
+        if "error" in toc:
+            doc.close()
+            raise HTTPException(status_code=422, detail=toc["error"])
+        chapters = toc.get("chapters", [])
+        cp = toc.get("contents_physical_page", 1)
+    chapters = _split_normalize_chapters(chapters)
     if not chapters:
         doc.close()
         raise HTTPException(status_code=422, detail="No chapters found in table of contents.")
-    # contents_physical_page is 1-based.
-    # Rule: page immediately after Contents = book page 1.
-    # fitz 0-based index of book page N = contents_physical_page + N - 1
-    cp = toc.get("contents_physical_page", 1)
     subject_name = _split_extract_subject_name(file.filename or "textbook.pdf")
+    ranges = _split_resolve_ranges(doc, chapters, cp, force_contents_mapping=(anchor_mode == "contents_page"))
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for i, ch in enumerate(chapters):
-            fitz_start = cp + ch["printed_page"] - 1
-            fitz_end = (cp + chapters[i + 1]["printed_page"] - 2) if i + 1 < len(chapters) else total_pages - 1
+        for ch in ranges:
             pdf_filename = f"{_split_safe_filename(ch['title'])}.pdf"
             zip_entry = f"{subject_name}/{pdf_filename}"
             chapter_doc = fitz.open()
-            chapter_doc.insert_pdf(doc, from_page=fitz_start, to_page=fitz_end)
+            chapter_doc.insert_pdf(doc, from_page=ch["fitz_start"], to_page=ch["fitz_end"])
             pdf_bytes = chapter_doc.tobytes(deflate=True)
             chapter_doc.close()
             zf.writestr(zip_entry, pdf_bytes)

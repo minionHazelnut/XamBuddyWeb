@@ -84,19 +84,31 @@ _CHAPTER_PREFIX = re.compile(
     r'^(chapter|ch\.?|unit|section|part)\s*[\d\w]+\.?\s*',
     re.IGNORECASE,
 )
+_WATERMARK_RE = re.compile(
+    r'@\S+\s+NOT\s+TO\s+BE\s+\w+',
+    re.IGNORECASE,
+)
+_FRONT_MATTER_RE = re.compile(
+    r'^(foreword|preface|contents|table\s+of\s+contents|constitution.*|about\s+(this\s+)?book|index|acknowledgements?|note\s+to\s+(teachers?|students?)|introduction)$',
+    re.IGNORECASE,
+)
 
 
 def _clean_title(raw: str) -> str:
     """
-    Remove redundant 'Chapter N' prefix so the chapter name itself remains.
+    Remove watermarks and redundant 'Chapter N' prefix so the chapter name itself remains.
     'Chapter 1 Real Numbers' -> 'Real Numbers'
-    'CHAPTER 1\nReal Numbers' -> 'Real Numbers'
     If nothing remains after stripping, return the original.
     """
+    raw = _WATERMARK_RE.sub('', raw).strip()
     cleaned = _CHAPTER_PREFIX.sub('', raw).strip()
     # Collapse internal whitespace
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     return cleaned if cleaned else raw.strip()
+
+
+def _has_letters(text: str) -> bool:
+    return any(c.isalpha() for c in text)
 
 
 def page_chapter_title(
@@ -108,12 +120,12 @@ def page_chapter_title(
     Return the chapter title if this page starts a new chapter, else None.
 
     Detection criteria:
-    - Text must be in the top 50 % of the page.
-    - The text must have font size >= body_size * threshold_multiplier,
-      OR be bold with size >= body_size * 1.1.
+    - Text must be in the top 65% of the page.
+    - Font size >= body_size * threshold_multiplier, OR bold with size >= body_size * 1.1.
+    - Spans containing only decorative/symbol characters (no letters) are ignored.
     - At least 2 characters must be present.
     """
-    top_half_y = page.rect.height * 0.5
+    top_region_y = page.rect.height * 0.65
     min_size = body_size * threshold_multiplier
     bold_min_size = body_size * 1.1
 
@@ -121,16 +133,16 @@ def page_chapter_title(
     found_prominent = False
 
     blocks = sorted(
-        page.get_text("dict")["blocks"],
-        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],  # sort top-to-bottom
+        page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"],
+        key=lambda b: b.get("bbox", [0, 0, 0, 0])[1],
     )
 
     for block in blocks:
         if block["type"] != 0:
             continue
         block_top_y = block.get("bbox", [0, 0, 0, 0])[1]
-        if block_top_y > top_half_y:
-            break  # past the top half — stop
+        if block_top_y > top_region_y:
+            break
 
         for line in block.get("lines", []):
             for span in line.get("spans", []):
@@ -141,7 +153,10 @@ def page_chapter_title(
                 is_bold = bool(span["flags"] & 16)
 
                 if size >= min_size or (is_bold and size >= bold_min_size):
-                    title_parts.append(text)
+                    clean = _WATERMARK_RE.sub('', text).strip()
+                    # Skip decorative font characters — real titles contain letters
+                    if clean and _has_letters(clean):
+                        title_parts.append(clean)
                     found_prominent = True
 
     if not found_prominent or not title_parts:
@@ -169,11 +184,13 @@ def find_chapters(
         if title:
             raw_hits.append((page_idx, title))
 
-    # Discard watermarks: text starting with @ or appearing on 3+ pages
+    # Discard repeated headers and front-matter pages
     title_counts: Counter = Counter(t for _, t in raw_hits)
     raw_hits = [
         (p, t) for p, t in raw_hits
-        if title_counts[t] < 3 and not t.startswith('@')
+        if title_counts[t] < 3
+        and not t.startswith('@')
+        and not _FRONT_MATTER_RE.match(t.strip())
     ]
 
     # Merge consecutive pages that are likely part of the same chapter heading

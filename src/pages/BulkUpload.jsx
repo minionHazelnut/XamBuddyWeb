@@ -16,7 +16,7 @@ function toTitleCase(text) {
 }
 
 const GRADES = ['6th', '7th', '8th', '9th', '10th', '11th', '12th']
-const BOARDS = ['CBSE', 'ICSE', 'State']
+const BOARDS = ['Stateboard', 'CBSE', 'ICSE']
 
 const BATCHES = [
   { q_type: 'mcq',        num_q: 25, label: 'MCQs (1/2)' },
@@ -28,19 +28,26 @@ const BATCHES = [
   { q_type: 'cbq',        num_q: 10, label: 'Case-Based Questions' },
 ]
 
+const ANSWER_FILE_RE = /answers?[-_\s]*[12]/i
+
 function parseFolderStructure(fileList) {
   const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.pdf'))
   const struct = {}
   for (const file of files) {
     const parts = file.webkitRelativePath.split('/')
-    // Expected: GradeFolder/SubjectFolder/chapter.pdf
-    // parts[parts.length - 2] = immediate parent folder = subject
     const subject = parts.length >= 2 ? parts[parts.length - 2] : 'Unknown'
-    if (!struct[subject]) struct[subject] = []
-    struct[subject].push(file)
+    if (!struct[subject]) struct[subject] = { chapters: [], answers: [] }
+    if (ANSWER_FILE_RE.test(file.name.replace(/\.pdf$/i, ''))) {
+      struct[subject].answers.push(file)
+    } else {
+      struct[subject].chapters.push(file)
+    }
   }
   for (const subject of Object.keys(struct)) {
-    struct[subject].sort((a, b) =>
+    struct[subject].chapters.sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+    )
+    struct[subject].answers.sort((a, b) =>
       a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
     )
   }
@@ -49,10 +56,9 @@ function parseFolderStructure(fileList) {
 
 export default function BulkUpload({ showStatus }) {
   const [grade, setGrade] = useState('')
-  const [board, setBoard] = useState('CBSE')
+  const [board, setBoard] = useState('Stateboard')
   const [structure, setStructure] = useState({})
   const [chapters, setChapters] = useState([])
-  const [extracting, setExtracting] = useState(false)
   const [processing, setProcessing] = useState(false)
   const [progress, setProgress] = useState(null)
   const [results, setResults] = useState([])
@@ -61,12 +67,14 @@ export default function BulkUpload({ showStatus }) {
   // Split PDF tool state
   const [splitOpen, setSplitOpen] = useState(false)
   const [splitFile, setSplitFile] = useState(null)
-  const [splitStartChapter, setSplitStartChapter] = useState(1)
-  const [splitThreshold, setSplitThreshold] = useState(1.4)
   const [splitPreviewing, setSplitPreviewing] = useState(false)
   const [splitDownloading, setSplitDownloading] = useState(false)
   const [splitPreview, setSplitPreview] = useState(null)
   const [splitError, setSplitError] = useState(null)
+  const [splitTocImage, setSplitTocImage] = useState(null)
+  const [splitTocDragging, setSplitTocDragging] = useState(false)
+  const [splitImageExtracting, setSplitImageExtracting] = useState(false)
+  const [splitContentsPage, setSplitContentsPage] = useState(1)
 
   const wakeLockRef = useRef(null)
   const processingRef = useRef(false)
@@ -79,7 +87,9 @@ export default function BulkUpload({ showStatus }) {
         try {
           wakeLockRef.current = await navigator.wakeLock.request('screen')
           setWakeLockActive(true)
-        } catch {}
+        } catch {
+          // Wake lock support varies by browser.
+        }
       }
     }
     document.addEventListener('visibilitychange', onVisibilityChange)
@@ -95,8 +105,15 @@ export default function BulkUpload({ showStatus }) {
 
   function removeFileFromStructure(subject, fileName) {
     setStructure(prev => {
-      const updated = { ...prev, [subject]: prev[subject].filter(f => f.name !== fileName) }
-      if (updated[subject].length === 0) {
+      const subj = prev[subject]
+      const updated = {
+        ...prev,
+        [subject]: {
+          chapters: subj.chapters.filter(f => f.name !== fileName),
+          answers: subj.answers.filter(f => f.name !== fileName),
+        }
+      }
+      if (updated[subject].chapters.length === 0 && updated[subject].answers.length === 0) {
         const { [subject]: _, ...rest } = updated
         return rest
       }
@@ -110,39 +127,20 @@ export default function BulkUpload({ showStatus }) {
     setChapters(prev => prev.filter((_, i) => i !== idx))
   }
 
-  async function handleExtractTitles() {
+  function handleExtractTitles() {
     if (!exam) { showStatus('Select an exam first', 'error'); return }
     if (Object.keys(structure).length === 0) { showStatus('Upload a folder first', 'error'); return }
-    setExtracting(true)
+
     const allChapters = []
 
-    for (const [subject, files] of Object.entries(structure)) {
+    for (const [subject, { chapters: files }] of Object.entries(structure)) {
       for (const file of files) {
-        const formData = new FormData()
-        formData.append('file', file)
-        formData.append('subject', subject)
-        formData.append('exam', exam)
-        try {
-          const res = await fetch(`${API_BASE}/api/extract-chapter-title`, { method: 'POST', body: formData })
-          const data = await res.json()
-          allChapters.push({
-            subject, file,
-            title: toTitleCase(data.chapter_title || file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ')),
-            chapterNumber: data.chapter_number,
-            confidence: data.confidence || 'low',
-            status: 'pending',
-            edited: false,
-          })
-        } catch {
-          allChapters.push({
-            subject, file,
-            title: toTitleCase(file.name.replace(/\.pdf$/i, '').replace(/[_-]/g, ' ')),
-            chapterNumber: null,
-            confidence: 'low',
-            status: 'pending',
-            edited: false,
-          })
-        }
+        const stem = file.name.replace(/\.pdf$/i, '')
+        const chNumMatch = stem.match(/^chapter\s*(\d+)/i)
+        const chapterNumber = chNumMatch ? parseInt(chNumMatch[1], 10) : null
+        const titleRaw = stem.replace(/^chapter\s*\d+\s*/i, '').replace(/[_-]/g, ' ').trim()
+        const title = toTitleCase(titleRaw || stem.replace(/[_-]/g, ' '))
+        allChapters.push({ subject, file, title, chapterNumber, confidence: 'high', status: 'pending', edited: false })
       }
     }
 
@@ -152,12 +150,7 @@ export default function BulkUpload({ showStatus }) {
     })
 
     setChapters(allChapters)
-    setExtracting(false)
-    const lowConf = allChapters.filter(c => c.confidence === 'low').length
-    showStatus(
-      `Titles extracted for ${allChapters.length} chapters${lowConf > 0 ? ` — ${lowConf} low-confidence (please review)` : ''}`,
-      lowConf > 0 ? 'error' : 'success'
-    )
+    showStatus(`${allChapters.length} chapter titles ready — edit any if needed`, 'success')
   }
 
   async function uploadChapterPdf(file, subject, chapter) {
@@ -172,7 +165,9 @@ export default function BulkUpload({ showStatus }) {
       if (error) return
       const { data: urlData } = supabase.storage.from('pdf-uploads').getPublicUrl(fileName)
       await supabase.from('pdf_uploads').insert({ board, grade, subject, chapter, chapter_pdf: urlData.publicUrl })
-    } catch {}
+    } catch {
+      // Best-effort storage mirror; generation can continue if this fails.
+    }
   }
 
   async function handleProcessAll() {
@@ -184,7 +179,9 @@ export default function BulkUpload({ showStatus }) {
       try {
         wakeLockRef.current = await navigator.wakeLock.request('screen')
         setWakeLockActive(true)
-      } catch {}
+      } catch {
+        // Wake lock support varies by browser.
+      }
     }
 
     // Target question counts per type (in DB, conceptual stores as 'long')
@@ -202,7 +199,32 @@ export default function BulkUpload({ showStatus }) {
           existingCounts[key] = (existingCounts[key] || 0) + row.count
         }
       }
-    } catch {}
+    } catch {
+      // Stats are an optimization; continue without them if unavailable.
+    }
+
+    // Build per-subject answers assignment map: chapterFileName → [answerFile, ...]
+    const chapterAnswersMap = {}
+    for (const [subject, { chapters: chs, answers: ans }] of Object.entries(structure)) {
+      if (ans.length === 0) continue
+      const N = chs.length
+      const splitIdx = Math.floor(N / 2)
+      chs.forEach((f, idx) => {
+        let files = []
+        if (ans.length >= 2) {
+          if (N % 2 === 0) {
+            files = idx < splitIdx ? [ans[0]] : [ans[1]]
+          } else {
+            if (idx < splitIdx) files = [ans[0]]
+            else if (idx === splitIdx) files = [ans[0], ans[1]]
+            else files = [ans[1]]
+          }
+        } else if (ans.length === 1) {
+          files = [ans[0]]
+        }
+        chapterAnswersMap[`${subject}||${f.name}`] = files
+      })
+    }
 
     const EMPTY_BREAKDOWN = { mcq: 0, vsa: 0, short: 0, long: 0, conceptual: 0, cbq: 0 }
     const allResults = []
@@ -242,7 +264,10 @@ export default function BulkUpload({ showStatus }) {
         formData.append('difficulty', 'mixed')
         formData.append('num_q', adjustedNumQ)
         if (ch.chapterNumber != null) formData.append('chapter_order', ch.chapterNumber)
-        if (ch.edited) formData.append('title_edited', 'true')
+        formData.append('title_edited', 'true')
+        const ansFiles = chapterAnswersMap[`${ch.subject}||${ch.file.name}`] || []
+        if (ansFiles[0]) formData.append('answers_file', ansFiles[0])
+        if (ansFiles[1]) formData.append('answers_file_2', ansFiles[1])
 
         try {
           let res
@@ -310,7 +335,9 @@ export default function BulkUpload({ showStatus }) {
     }
 
     if (wakeLockRef.current) {
-      try { await wakeLockRef.current.release() } catch {}
+      try { await wakeLockRef.current.release() } catch {
+        // Nothing to recover; the browser may have already released it.
+      }
       wakeLockRef.current = null
     }
     processingRef.current = false
@@ -328,19 +355,54 @@ export default function BulkUpload({ showStatus }) {
     try {
       const fd = new FormData()
       fd.append('file', splitFile)
-      fd.append('start_chapter', splitStartChapter)
-      fd.append('threshold', splitThreshold)
       const res = await fetch(`${API_BASE}/api/split-pdf/preview`, { method: 'POST', body: fd })
       const data = await res.json()
       if (!res.ok || data.error) {
         setSplitError(data.error || data.detail || `Error ${res.status}`)
       } else {
-        setSplitPreview(data)
+        setSplitContentsPage(data.contents_physical_page || 1)
+        setSplitPreview({ ...data, source: 'pdf' })
       }
     } catch (err) {
       setSplitError(err.message)
     } finally {
       setSplitPreviewing(false)
+    }
+  }
+
+  function handleSplitTocImage(file) {
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      setSplitError('Please drop an image screenshot of the Contents or Index page.')
+      return
+    }
+    setSplitTocImage(file)
+    setSplitPreview(null)
+    setSplitError(null)
+  }
+
+  async function handleSplitImagePreview() {
+    if (!splitFile || !splitTocImage) return
+    setSplitImageExtracting(true)
+    setSplitPreview(null)
+    setSplitError(null)
+    try {
+      const previewFd = new FormData()
+      previewFd.append('file', splitFile)
+      previewFd.append('toc_image', splitTocImage)
+      previewFd.append('contents_physical_page', String(Math.max(1, Number(splitContentsPage) || 1)))
+      previewFd.append('anchor_mode', 'contents_page')
+      const previewRes = await fetch(`${API_BASE}/api/split-pdf/preview`, { method: 'POST', body: previewFd })
+      const previewData = await previewRes.json()
+      if (!previewRes.ok || previewData.error || previewData.detail) {
+        setSplitError(previewData.error || previewData.detail || `Error ${previewRes.status}`)
+      } else {
+        setSplitPreview({ ...previewData, source: 'image' })
+      }
+    } catch (err) {
+      setSplitError(err.message)
+    } finally {
+      setSplitImageExtracting(false)
     }
   }
 
@@ -350,8 +412,12 @@ export default function BulkUpload({ showStatus }) {
     try {
       const fd = new FormData()
       fd.append('file', splitFile)
-      fd.append('start_chapter', splitStartChapter)
-      fd.append('threshold', splitThreshold)
+      if (splitPreview?.source === 'image') {
+        const chaptersForDownload = splitPreview.chapters.map(({ title, printed_page }) => ({ title, printed_page }))
+        fd.append('chapters_json', JSON.stringify(chaptersForDownload))
+        fd.append('contents_physical_page', String(splitPreview.contents_physical_page || splitContentsPage || 1))
+        fd.append('anchor_mode', 'contents_page')
+      }
       const res = await fetch(`${API_BASE}/api/split-pdf/download`, { method: 'POST', body: fd })
       if (!res.ok) {
         const data = await res.json()
@@ -375,7 +441,7 @@ export default function BulkUpload({ showStatus }) {
   }
 
   const subjectCount = Object.keys(structure).length
-  const totalFiles = Object.values(structure).reduce((s, f) => s + f.length, 0)
+  const totalFiles = Object.values(structure).reduce((s, v) => s + v.chapters.length + v.answers.length, 0)
 
   return (
     <div className="page-content">
@@ -417,15 +483,31 @@ export default function BulkUpload({ showStatus }) {
 
         {subjectCount > 0 && (
           <div style={{ marginTop: '12px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #d4e0de' }}>
-            {Object.entries(structure).map(([subject, files]) => (
+            {Object.entries(structure).map(([subject, { chapters: cFiles, answers: aFiles }]) => (
               <div key={subject}>
                 <div style={{ padding: '5px 12px', background: '#e0ebe9', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <strong style={{ fontSize: '13px', color: '#2d4a47' }}>{subject}</strong>
-                  <span style={{ fontSize: '12px', color: '#6b8a80' }}>{files.length} PDF{files.length !== 1 ? 's' : ''}</span>
+                  <span style={{ fontSize: '12px', color: '#6b8a80' }}>
+                    {cFiles.length} chapter{cFiles.length !== 1 ? 's' : ''}
+                    {aFiles.length > 0 ? ` · ${aFiles.length} answers PDF${aFiles.length !== 1 ? 's' : ''}` : ''}
+                  </span>
                 </div>
-                {files.map(f => (
+                {cFiles.map(f => (
                   <div key={f.name} style={{ display: 'flex', alignItems: 'center', padding: '3px 12px', borderBottom: '1px solid #edf2f1', fontSize: '13px', color: '#4a6e6a' }}>
                     <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.name}</span>
+                    <button
+                      onClick={() => removeFileFromStructure(subject, f.name)}
+                      title="Remove from queue"
+                      style={{ background: 'none', border: 'none', color: '#bbb', cursor: 'pointer', fontSize: '17px', lineHeight: 1, padding: '0 4px', flexShrink: 0 }}
+                    >×</button>
+                  </div>
+                ))}
+                {aFiles.map(f => (
+                  <div key={f.name} style={{ display: 'flex', alignItems: 'center', padding: '3px 12px', borderBottom: '1px solid #edf2f1', fontSize: '13px', color: '#6b8a80', background: '#f7fbfa' }}>
+                    <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <span style={{ fontSize: '10px', background: '#c8e6c9', color: '#2e7d32', borderRadius: '3px', padding: '1px 4px', marginRight: '6px', fontWeight: '600' }}>ANS</span>
+                      {f.name}
+                    </span>
                     <button
                       onClick={() => removeFileFromStructure(subject, f.name)}
                       title="Remove from queue"
@@ -439,8 +521,8 @@ export default function BulkUpload({ showStatus }) {
         )}
 
         {subjectCount > 0 && (
-          <button onClick={handleExtractTitles} disabled={extracting || processing || !exam} style={{ marginTop: '16px' }}>
-            {extracting ? 'Extracting Titles...' : 'Extract Chapter Titles from PDFs'}
+          <button onClick={handleExtractTitles} disabled={processing || !exam} style={{ marginTop: '16px' }}>
+            Extract Chapter Titles
           </button>
         )}
       </div>
@@ -452,7 +534,7 @@ export default function BulkUpload({ showStatus }) {
             <h3 style={{ margin: 0 }}>Extracted Chapters ({chapters.length}) — edit any title if wrong</h3>
             <button
               onClick={handleProcessAll}
-              disabled={processing || extracting}
+              disabled={processing}
               style={{ background: '#2d4a47', color: '#fff', border: 'none', borderRadius: '8px', padding: '10px 20px', cursor: 'pointer', fontWeight: '600', fontSize: '14px' }}
             >
               {processing ? 'Processing...' : '⚡ Generate All Chapters (150 Qs each)'}
@@ -642,7 +724,7 @@ export default function BulkUpload({ showStatus }) {
         {splitOpen && (
           <div style={{ marginTop: '16px' }}>
             <p style={{ color: '#6b8a80', fontSize: '13px', margin: '0 0 14px 0' }}>
-              Upload a full textbook PDF. The tool detects chapter headings by font size and splits it into per-chapter PDFs packaged as a ZIP — ready to upload above.
+              Upload a full textbook PDF. The tool reads the Contents page, extracts chapter names and page numbers exactly as listed, and packages each chapter as a separate PDF in a ZIP — ready to upload above. Answers sections are automatically separated too.
             </p>
 
             {/* Inputs */}
@@ -662,26 +744,6 @@ export default function BulkUpload({ showStatus }) {
                 />
               </div>
 
-              <div className="form-group" style={{ flex: '0 0 130px' }}>
-                <label>Start chapter #:</label>
-                <input
-                  type="number" min="1" value={splitStartChapter}
-                  onChange={e => { setSplitStartChapter(parseInt(e.target.value) || 1); setSplitPreview(null) }}
-                  style={{ width: '100%' }}
-                />
-              </div>
-
-              <div className="form-group" style={{ flex: '0 0 160px' }}>
-                <label title="Increase if too many false positives; decrease if chapters are missed">
-                  Threshold (1.2–1.8):
-                </label>
-                <input
-                  type="number" min="1.0" max="2.0" step="0.1" value={splitThreshold}
-                  onChange={e => { setSplitThreshold(parseFloat(e.target.value) || 1.4); setSplitPreview(null) }}
-                  style={{ width: '100%' }}
-                />
-              </div>
-
               <div className="form-group" style={{ flex: '0 0 auto' }}>
                 <label style={{ visibility: 'hidden' }}>.</label>
                 <button
@@ -689,9 +751,74 @@ export default function BulkUpload({ showStatus }) {
                   disabled={!splitFile || splitPreviewing || splitDownloading}
                   style={{ whiteSpace: 'nowrap' }}
                 >
-                  {splitPreviewing ? 'Detecting...' : 'Preview Chapters'}
+                  {splitPreviewing ? 'Reading Contents...' : 'Preview Chapters'}
                 </button>
               </div>
+            </div>
+
+            <div style={{ marginTop: '14px', padding: '14px', border: '1px solid #d4e0de', borderRadius: '8px', background: '#f8fcfa' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', gap: '12px', alignItems: 'flex-start', flexWrap: 'wrap', marginBottom: '10px' }}>
+                <div style={{ flex: 1 }}>
+                  <strong style={{ color: '#2d4a47', fontSize: '13px' }}>Index screenshot fallback</strong>
+                  <p style={{ color: '#6b8a80', fontSize: '12px', margin: '4px 0 0 0' }}>
+                    Drop a screenshot of the Contents/Index page if auto-detection fails. Also set the page number below.
+                  </p>
+                </div>
+                <div style={{ width: '210px', flexShrink: 0 }}>
+                  <label style={{ display: 'block', marginBottom: '4px', fontSize: '12px', fontWeight: 600, color: '#4a6e6a' }}>
+                    Contents page # in PDF
+                  </label>
+                  <input
+                    type="number"
+                    min="1"
+                    value={splitContentsPage}
+                    onChange={e => { setSplitContentsPage(e.target.value); setSplitPreview(null); setSplitError(null) }}
+                    style={{ padding: '8px 10px', fontSize: '13px', width: '100%' }}
+                  />
+                  <p style={{ color: '#6b8a80', fontSize: '11px', margin: '4px 0 0 0', lineHeight: '1.4' }}>
+                    Open the PDF in a viewer, go to the Contents/Index page, note the page count shown (e.g. "6 of 120"). Enter that number here.
+                  </p>
+                </div>
+              </div>
+
+              <label
+                htmlFor="splitTocImageInput"
+                onDragOver={e => { e.preventDefault(); setSplitTocDragging(true) }}
+                onDragLeave={() => setSplitTocDragging(false)}
+                onDrop={e => {
+                  e.preventDefault()
+                  setSplitTocDragging(false)
+                  handleSplitTocImage(e.dataTransfer.files?.[0])
+                }}
+                style={{
+                  display: 'block',
+                  padding: '18px',
+                  border: `2px dashed ${splitTocDragging ? '#4a6e6a' : splitTocImage ? '#28a745' : '#b8d8cc'}`,
+                  borderRadius: '8px',
+                  background: splitTocDragging ? '#eef8f3' : splitTocImage ? '#edf8ef' : '#fff',
+                  color: splitTocImage ? '#155724' : '#6b8a80',
+                  textAlign: 'center',
+                  cursor: 'pointer',
+                  fontSize: '13px'
+                }}
+              >
+                {splitTocImage ? splitTocImage.name : 'Drag index/contents screenshot here, or click to select image'}
+              </label>
+              <input
+                type="file"
+                id="splitTocImageInput"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={e => handleSplitTocImage(e.target.files?.[0])}
+              />
+
+              <button
+                onClick={handleSplitImagePreview}
+                disabled={!splitFile || !splitTocImage || splitImageExtracting || splitPreviewing || splitDownloading}
+                style={{ marginTop: '10px', whiteSpace: 'nowrap' }}
+              >
+                {splitImageExtracting ? 'Reading Screenshot...' : 'Use Screenshot for Chapters'}
+              </button>
             </div>
 
             {/* Error */}
@@ -706,9 +833,11 @@ export default function BulkUpload({ showStatus }) {
               <div style={{ marginTop: '14px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
                   <div style={{ fontSize: '13px', color: '#4a6e6a' }}>
-                    <strong>{splitPreview.chapters.length} chapters</strong> detected &nbsp;·&nbsp;
+                    <strong>{splitPreview.chapters.length} entries</strong> found in Contents &nbsp;·&nbsp;
+                    Source: <code style={{ background: '#e8f0ee', padding: '1px 5px', borderRadius: '3px' }}>{splitPreview.source === 'image' ? 'screenshot + PDF match' : 'PDF'}</code> &nbsp;·&nbsp;
+                    Contents page: <strong>{splitPreview.contents_physical_page}</strong> &nbsp;·&nbsp;
                     Subject folder: <code style={{ background: '#e8f0ee', padding: '1px 5px', borderRadius: '3px' }}>{splitPreview.subject_name}</code> &nbsp;·&nbsp;
-                    Body font: {splitPreview.body_size}pt &nbsp;·&nbsp; {splitPreview.total_pages} pages total
+                    {splitPreview.total_pages} pages total
                   </div>
                   <button
                     onClick={handleSplitDownload}
@@ -722,25 +851,24 @@ export default function BulkUpload({ showStatus }) {
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
                   <thead>
                     <tr style={{ borderBottom: '2px solid #e0e8e6', textAlign: 'left' }}>
-                      <th style={{ padding: '5px 8px' }}>#</th>
-                      <th style={{ padding: '5px 8px' }}>Detected Title</th>
-                      <th style={{ padding: '5px 8px' }}>Pages</th>
+                      <th style={{ padding: '5px 8px' }}>Chapter Title (from Contents)</th>
+                      <th style={{ padding: '5px 8px' }}>Book Pages</th>
+                      <th style={{ padding: '5px 8px' }}>Page Count</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {splitPreview.chapters.map(ch => (
-                      <tr key={ch.number} style={{ borderBottom: '1px solid #e0e8e6' }}>
-                        <td style={{ padding: '5px 8px', color: '#6b8a80', fontWeight: '600' }}>{ch.number}</td>
-                        <td style={{ padding: '5px 8px' }}>{ch.title}</td>
-                        <td style={{ padding: '5px 8px', color: '#6b8a80' }}>{ch.start_page}–{ch.end_page} ({ch.pages} pg)</td>
+                    {splitPreview.chapters.map((ch, i) => (
+                      <tr key={i} style={{ borderBottom: '1px solid #e0e8e6' }}>
+                        <td style={{ padding: '5px 8px', fontWeight: '500' }}>{ch.title}</td>
+                        <td style={{ padding: '5px 8px', color: '#6b8a80' }}>{ch.printed_page} – {ch.end_printed_page}</td>
+                        <td style={{ padding: '5px 8px', color: '#6b8a80' }}>{ch.pages} pg</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
 
                 <p style={{ marginTop: '10px', fontSize: '12px', color: '#6b8a80' }}>
-                  If chapters look wrong, adjust the threshold and click Preview again.
-                  The ZIP folder will be named <strong>{splitPreview.subject_name}</strong> — use that exact name as the subject folder when uploading above.
+                  Chapter titles are copied exactly from the Contents page. The ZIP folder will be named <strong>{splitPreview.subject_name}</strong> — use that exact name as the subject folder when uploading above.
                 </p>
               </div>
             )}

@@ -1,5 +1,5 @@
 # XamBuddy Admin Panel — Progress & Status
-**Last Updated**: April 29, 2026
+**Last Updated**: April 30, 2026
 
 ---
 
@@ -61,12 +61,16 @@
 - Admin dashboard shows existing vs newly generated questions side by side
 - "Generate All" button: generates ~150 questions across all types in 7 batches with per-batch progress bar
 - Chapter title auto-extracted from PDF first page via Claude (`/api/extract-chapter-title`); cached in `chapter_meta` by filename
-- Bulk chapter folder upload: parses folder by subject, auto-extracts titles, editable before generation (BulkUpload.jsx)
+- Bulk chapter folder upload: parses folder by subject, auto-extracts titles from filename (strips "Chapter N" prefix), editable before generation (BulkUpload.jsx)
+- Default board is **Stateboard**; boards available: Stateboard, CBSE, ICSE
+- **Answer PDF pairing**: folder may contain `answers-1.pdf` / `answers-2.pdf` alongside chapter PDFs; split evenly across chapters (odd chapter count → middle chapter gets both); passed to `/api/generate` as `answers_file` / `answers_file_2`
 - Bulk upload resumes correctly on re-run: fetches existing counts from `/api/stats` at start, skips completed types, tops up partial ones — no duplicates
 - Re-use stored chapter PDF from Supabase Storage for re-generation (no re-upload needed)
 - Chapter history table: shows all chapters with generation stats
-- Chapter mismatch check: validates chapter name against PDF content before generating; logs error and aborts if mismatch
-- **PDF Splitter tool** (BulkUpload.jsx + `/api/split-pdf/preview` + `/api/split-pdf/download`): upload a full textbook PDF → Claude reads the Contents/Index page and extracts chapter titles + printed page numbers verbatim → page immediately after the Contents page is treated as book page 1 (all earlier pages are ignored) → each chapter split exactly by printed page range → Answers/Solutions section split as a separate PDF → packaged as a ZIP ready for bulk upload
+- Chapter mismatch check: validates chapter name against PDF content before generating; logs error and aborts if mismatch; always sends `title_edited: true` in bulk upload to skip mismatch for non-English (Kannada) chapter PDFs
+- **PDF Splitter tool** (BulkUpload.jsx + `/api/split-pdf/preview` + `/api/split-pdf/download`): upload a full textbook PDF → detects Contents page automatically (embedded bookmarks → text scan → font-size detection) → extracts chapter titles + printed page numbers → page immediately after Contents = book page 1, all earlier pages excluded → each chapter split by exact page range → packaged as ZIP
+- **PDF Splitter screenshot fallback**: when auto-detection fails (e.g. Kannada/non-English TOC), user drops a screenshot of the Contents page + enters the PDF page number of that page; Claude vision reads the screenshot and extracts chapter entries; `contents_physical_page` anchors book page 1 correctly; visual page-search skipped when page number is provided (fast path)
+- **PDF Splitter non-English handling**: `_split_detect_body_font_size` calibrates threshold using English-only text spans; `_split_find_chapters_by_font` skips pages with no English content; font-size detection now works correctly for bilingual PDFs (e.g. KTBS Karnataka state board) where Kannada text would otherwise inflate the body-size threshold
 
 ### Not Done
 - Rename/migrate `questions` table to `generated_questions` (still `questions`)
@@ -92,7 +96,7 @@
 - Supabase Auth: admin login + protected routes (AdminLogin.jsx, ProtectedRoute)
 - Sidebar navigation with 8 tabs
 - Batch generation progress bar ("Generate All" flow in GenerateQuestions.jsx)
-- **Split Textbook PDF panel** in BulkUpload.jsx: collapsible UI with PDF upload, start-chapter number, threshold control, chapter preview table, and one-click ZIP download
+- **Split Textbook PDF panel** in BulkUpload.jsx: collapsible UI with PDF upload, chapter preview table, one-click ZIP download, and screenshot fallback section (drag-drop image + "Contents page # in PDF" input with clear instructions)
 
 ### Not Done
 - Real-time step-by-step processing log during single PDF upload/generation (single-file uploads show a spinner only, not a step-by-step log)

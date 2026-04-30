@@ -1,5 +1,5 @@
 # XamBuddy Project Status
-**Last Updated**: April 29, 2026
+**Last Updated**: April 30, 2026
 
 ---
 
@@ -35,14 +35,14 @@ XamBuddy is an educational platform for CBSE Class 10 and 12 students. The curre
 - Reference upload registration (`reference_uploads` table)
 - Edit and delete generated questions (`PATCH`/`DELETE /api/questions/{id}`)
 - Full API endpoint list: see `docs/PROGRESS.md`
-- Split-PDF endpoints: `/api/split-pdf/preview` (chapter detection) and `/api/split-pdf/download` (ZIP stream); uses PyMuPDF font-size analysis with watermark filtering
+- Split-PDF endpoints: `/api/split-pdf/preview` and `/api/split-pdf/download`; detection chain: embedded bookmarks → text scan (any language) → font-size (English-only calibration); screenshot fallback via `toc_image` upload + `contents_physical_page` form param; visual page-match skipped when page number is explicitly provided
 
 ### Frontend (`src/`)
 - **AdminLogin.jsx** — Supabase email/password login
 - **AdminDashboard.jsx** — Sidebar shell with 8 tabs
 - **Dashboard.jsx** — Drillable question inventory (exam → subject → chapter)
 - **GenerateQuestions.jsx** — Single PDF upload + Generate All (150 questions, 7 batches, progress bar)
-- **BulkUpload.jsx** — Bulk chapter folder upload with auto title extraction, editable chapter list, and built-in PDF splitter tool
+- **BulkUpload.jsx** — Bulk chapter folder upload: titles extracted from filenames (strips "Chapter N"), default board Stateboard, answer PDF pairing (answers-1/2 split evenly across chapters), built-in PDF splitter with screenshot fallback
 - **RetrieveQuestions.jsx** — Filter, view, inline-edit, and delete generated questions
 - **ExamPaperUploads.jsx** — Single and bulk exam paper + answer key uploads with filename-based auto-detection
 - **ExamPaperRetrieve.jsx** — View papers and drill into extracted questions per paper
@@ -55,7 +55,7 @@ XamBuddy is an educational platform for CBSE Class 10 and 12 students. The curre
 
 See `docs/PROGRESS.md` for the full breakdown. High-level gaps:
 
-- **Split PDF**: chapter detection is font-size heuristic based; scanned PDFs or PDFs with non-standard fonts may need threshold adjustment
+- **Split PDF**: auto-detection still fails for fully scanned PDFs (no text layer); screenshot fallback required in those cases; visual page-matching (cosine similarity on ink grid) only runs when no page number is provided
 - **Schema**: `questions` table still uses combined `exam` field instead of separate `class_level`/`board`; no `times_served`/`last_served_at`
 - **Validation**: keyword count checks for SA/LA not enforced; question text `?` check not enforced
 - **UI**: no real-time step-by-step progress log for single uploads; no dedicated post-processing summary screen
