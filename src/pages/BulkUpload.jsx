@@ -71,7 +71,7 @@ export default function BulkUpload({ showStatus }) {
   const [splitDownloading, setSplitDownloading] = useState(false)
   const [splitPreview, setSplitPreview] = useState(null)
   const [splitError, setSplitError] = useState(null)
-  const [splitTocImage, setSplitTocImage] = useState(null)
+  const [splitTocImages, setSplitTocImages] = useState([])
   const [splitTocDragging, setSplitTocDragging] = useState(false)
   const [splitImageExtracting, setSplitImageExtracting] = useState(false)
   const [splitContentsPage, setSplitContentsPage] = useState(1)
@@ -370,26 +370,31 @@ export default function BulkUpload({ showStatus }) {
     }
   }
 
-  function handleSplitTocImage(file) {
-    if (!file) return
-    if (!file.type.startsWith('image/')) {
-      setSplitError('Please drop an image screenshot of the Contents or Index page.')
+  function handleSplitTocImagesAdd(files) {
+    const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'))
+    if (imageFiles.length === 0) {
+      setSplitError('Please select image files for the Contents page screenshot.')
       return
     }
-    setSplitTocImage(file)
+    setSplitTocImages(prev => [...prev, ...imageFiles])
     setSplitPreview(null)
     setSplitError(null)
   }
 
+  function removeSplitTocImage(index) {
+    setSplitTocImages(prev => prev.filter((_, i) => i !== index))
+    setSplitPreview(null)
+  }
+
   async function handleSplitImagePreview() {
-    if (!splitFile || !splitTocImage) return
+    if (!splitFile || splitTocImages.length === 0) return
     setSplitImageExtracting(true)
     setSplitPreview(null)
     setSplitError(null)
     try {
       const previewFd = new FormData()
       previewFd.append('file', splitFile)
-      previewFd.append('toc_image', splitTocImage)
+      splitTocImages.forEach(img => previewFd.append('toc_images', img))
       previewFd.append('contents_physical_page', String(Math.max(1, Number(splitContentsPage) || 1)))
       previewFd.append('anchor_mode', 'contents_page')
       const previewRes = await fetch(`${API_BASE}/api/split-pdf/preview`, { method: 'POST', body: previewFd })
@@ -788,33 +793,51 @@ export default function BulkUpload({ showStatus }) {
                 onDrop={e => {
                   e.preventDefault()
                   setSplitTocDragging(false)
-                  handleSplitTocImage(e.dataTransfer.files?.[0])
+                  handleSplitTocImagesAdd(e.dataTransfer.files)
                 }}
                 style={{
                   display: 'block',
-                  padding: '18px',
-                  border: `2px dashed ${splitTocDragging ? '#4a6e6a' : splitTocImage ? '#28a745' : '#b8d8cc'}`,
+                  padding: '14px 18px',
+                  border: `2px dashed ${splitTocDragging ? '#4a6e6a' : splitTocImages.length > 0 ? '#28a745' : '#b8d8cc'}`,
                   borderRadius: '8px',
-                  background: splitTocDragging ? '#eef8f3' : splitTocImage ? '#edf8ef' : '#fff',
-                  color: splitTocImage ? '#155724' : '#6b8a80',
+                  background: splitTocDragging ? '#eef8f3' : '#fff',
+                  color: '#6b8a80',
                   textAlign: 'center',
                   cursor: 'pointer',
                   fontSize: '13px'
                 }}
               >
-                {splitTocImage ? splitTocImage.name : 'Drag index/contents screenshot here, or click to select image'}
+                {splitTocImages.length > 0
+                  ? `+ Add more pages (${splitTocImages.length} image${splitTocImages.length > 1 ? 's' : ''} added)`
+                  : 'Drag contents/index screenshot here, or click to select'}
               </label>
               <input
                 type="file"
                 id="splitTocImageInput"
                 accept="image/*"
+                multiple
                 style={{ display: 'none' }}
-                onChange={e => handleSplitTocImage(e.target.files?.[0])}
+                onChange={e => { handleSplitTocImagesAdd(e.target.files); e.target.value = '' }}
               />
+
+              {splitTocImages.length > 0 && (
+                <div style={{ marginTop: '8px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                  {splitTocImages.map((img, i) => (
+                    <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: '#edf8ef', borderRadius: '6px', fontSize: '12px', color: '#155724' }}>
+                      <span>Page {i + 1}: {img.name}</span>
+                      <button
+                        onClick={() => removeSplitTocImage(i)}
+                        style={{ background: 'none', border: 'none', color: '#c0392b', cursor: 'pointer', fontSize: '14px', padding: '0 4px', lineHeight: 1 }}
+                        title="Remove"
+                      >×</button>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <button
                 onClick={handleSplitImagePreview}
-                disabled={!splitFile || !splitTocImage || splitImageExtracting || splitPreviewing || splitDownloading}
+                disabled={!splitFile || splitTocImages.length === 0 || splitImageExtracting || splitPreviewing || splitDownloading}
                 style={{ marginTop: '10px', whiteSpace: 'nowrap' }}
               >
                 {splitImageExtracting ? 'Reading Screenshot...' : 'Use Screenshot for Chapters'}

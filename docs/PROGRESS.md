@@ -1,5 +1,5 @@
 # XamBuddy Admin Panel — Progress & Status
-**Last Updated**: April 30, 2026
+**Last Updated**: May 3, 2026
 
 ---
 
@@ -69,7 +69,8 @@
 - Chapter history table: shows all chapters with generation stats
 - Chapter mismatch check: validates chapter name against PDF content before generating; logs error and aborts if mismatch; always sends `title_edited: true` in bulk upload to skip mismatch for non-English (Kannada) chapter PDFs
 - **PDF Splitter tool** (BulkUpload.jsx + `/api/split-pdf/preview` + `/api/split-pdf/download`): upload a full textbook PDF → detects Contents page automatically (embedded bookmarks → text scan → font-size detection) → extracts chapter titles + printed page numbers → page immediately after Contents = book page 1, all earlier pages excluded → each chapter split by exact page range → packaged as ZIP
-- **PDF Splitter screenshot fallback**: when auto-detection fails (e.g. Kannada/non-English TOC), user drops a screenshot of the Contents page + enters the PDF page number of that page; Claude vision reads the screenshot and extracts chapter entries; `contents_physical_page` anchors book page 1 correctly; visual page-search skipped when page number is provided (fast path)
+- **PDF Splitter screenshot fallback**: when auto-detection fails (e.g. Kannada/non-English TOC), user drops 1–3 screenshots of the Contents/Index page(s) + enters the PDF page number of the first Contents page; Claude vision reads all screenshots in one call and extracts only top-level chapter headings (sub-topics like 1.1, 1.2 ignored); multiple images supported for TOCs that span 2+ pages
+- **PDF Splitter screenshot page mapping**: physical page for each chapter resolved via `_split_find_content_start_idx` — scans the 10 pages immediately after the last TOC page, finds the first visible margin number, and anchors printed page 1 from there; adapts automatically to books with 0, 1, or 2 unnumbered opener/blank pages between TOC and content; `final_cp` passed to this function = `first_cp + num_toc_images − 1` (last TOC page, 1-indexed); full PDF margin scan disabled in screenshot mode to avoid false anchors from chapter-opener spreads
 - **PDF Splitter non-English handling**: `_split_detect_body_font_size` calibrates threshold using English-only text spans; `_split_find_chapters_by_font` skips pages with no English content; font-size detection now works correctly for bilingual PDFs (e.g. KTBS Karnataka state board) where Kannada text would otherwise inflate the body-size threshold
 
 ### Not Done
@@ -157,6 +158,7 @@
 | POST | `/api/extract-chapter-title` | Extract chapter title from PDF first page |
 | POST | `/api/split-pdf/preview` | Detect chapter boundaries in a PDF; returns chapter list with page ranges |
 | POST | `/api/split-pdf/download` | Split PDF into chapters and stream as a ZIP file |
+| POST | `/api/split-pdf/toc-from-image` | Extract chapter titles + page numbers from a single TOC screenshot using Claude vision |
 
 ---
 

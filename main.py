@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 import json
 import base64
 import os
@@ -1217,37 +1217,40 @@ def _split_find_contents_page_from_image(doc, image_bytes: bytes, chapters: list
     return best["idx"] + 1
 
 
-def _split_extract_chapters_from_image_bytes(img_bytes: bytes, media_type: str) -> list:
-    img_b64 = base64.b64encode(img_bytes).decode()
+def _split_extract_chapters_from_image_bytes(images: list) -> list:
+    # images: list of (bytes, media_type) tuples — supports multi-page TOC screenshots
+    content = []
+    for i, (img_bytes, media_type) in enumerate(images):
+        img_b64 = base64.b64encode(img_bytes).decode()
+        if len(images) > 1:
+            content.append({"type": "text", "text": f"[Contents page {i + 1} of {len(images)}]"})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}})
+    multi_note = " (spanning multiple pages)" if len(images) > 1 else ""
+    content.append({"type": "text", "text": (
+        f"This is a screenshot of a textbook Contents or Index page{multi_note}. "
+        "The book may be bilingual (e.g., Kannada + English, Hindi + English) or in any language.\n\n"
+        "Task: extract ONLY the main chapter titles and their page numbers. Ignore all sub-topics.\n\n"
+        "Return ONLY valid JSON, no markdown fences:\n"
+        '{"chapters": [{"title": "Chapter Title", "printed_page": 1}, ...]}\n\n'
+        "Critical rules:\n"
+        "1. ONLY extract top-level chapter headings — these are typically bold, larger text, or numbered like '1.', '2.', 'Chapter 1', etc.\n"
+        "2. SKIP all sub-topics/sub-sections — lines numbered like '1.1', '1.2', '2.1', '2.3' etc. are sub-topics, ignore them entirely\n"
+        "3. PAGE NUMBER is the Arabic numeral at the RIGHT/END of the chapter heading line — NOT the chapter number at the start\n"
+        "4. If the line looks like: '3. Chapter Name ......... 45' → printed_page is 45, not 3\n"
+        "5. If both a Kannada/regional title and an English title are on the same line, use the English one\n"
+        "6. If only a non-English title is present, use it as-is (transliterate if possible)\n"
+        "7. Include top-level Answers/Solutions/Activities sections if listed as a main entry (not a sub-topic)\n"
+        "8. Skip: Foreword, Preface, Publisher info, roman-numeral page entries\n"
+        "9. printed_page must be a positive integer — skip lines where you cannot confidently read the number\n"
+        "10. These are TEXTBOOK printed page numbers, not PDF physical page positions"
+    )})
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=2000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
-                {"type": "text", "text": (
-                    "This is a screenshot of a textbook Contents or Index page. "
-                    "The book may be bilingual (e.g., Kannada + English, Hindi + English) or in any language.\n\n"
-                    "Task: for every chapter or section line, extract the title and the PAGE NUMBER at the end of the line.\n\n"
-                    "Return ONLY valid JSON, no markdown fences:\n"
-                    '{"chapters": [{"title": "Chapter Title", "printed_page": 1}, ...]}\n\n'
-                    "Critical rules:\n"
-                    "1. PAGE NUMBER is always the Arabic numeral (1, 2, 3…) at the RIGHT/END of each line — NOT the chapter number at the start\n"
-                    "2. If the line looks like: '3. Chapter Name ......... 45' → printed_page is 45, not 3\n"
-                    "3. If both a Kannada/regional title and an English title are on the same line, use the English one\n"
-                    "4. If only a non-English title is present, use it as-is (transliterate if possible)\n"
-                    "5. Include all main chapters plus Answers/Solutions/Activities sections if listed\n"
-                    "6. Skip: Foreword, Preface, Publisher info, roman-numeral page entries\n"
-                    "7. printed_page must be a positive integer — skip lines where you cannot confidently read the number\n"
-                    "8. These are TEXTBOOK printed page numbers, not PDF physical page positions"
-                )}
-            ]
-        }],
+        messages=[{"role": "user", "content": content}],
     )
     raw = response.content[0].text.strip()
-    # Strip markdown code fences if Claude wrapped the response
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("`").strip()
     start, end = raw.find("{"), raw.rfind("}") + 1
@@ -1299,15 +1302,45 @@ def _split_detect_printed_page_map(doc) -> dict:
     return page_map
 
 
+def _split_find_content_start_idx(doc, last_toc_physical: int) -> int:
+    """
+    Find the 0-indexed physical page where printed page 1 begins by scanning
+    the pages immediately after the TOC. Handles books where opener/blank pages
+    between TOC and content have no margin numbers.
+    """
+    last_toc_idx = last_toc_physical - 1  # convert 1-indexed to 0-indexed
+    search_end = min(len(doc), last_toc_idx + 1 + 10)
+    for idx in range(last_toc_idx + 1, search_end):
+        page_num = _split_margin_page_number(doc[idx])
+        if page_num is not None and 1 <= page_num <= 10:
+            start = idx - (page_num - 1)
+            return max(start, last_toc_idx + 1)
+    # Nothing found — assume content starts immediately after TOC
+    return last_toc_idx + 1
+
+
 def _split_resolve_ranges(doc, chapters: list, contents_physical_page: int, force_contents_mapping: bool = False) -> list:
-    page_map = {} if force_contents_mapping else _split_detect_printed_page_map(doc)
-    title_starts = {} if force_contents_mapping else _split_find_chapter_starts_by_title(doc, chapters)
+    if force_contents_mapping:
+        # In screenshot mode, find the actual start of content by scanning the
+        # few pages right after the TOC. This handles books that have 0, 1, or 2
+        # unnumbered opener/blank pages before the first numbered content page,
+        # without needing a hard-coded offset that breaks on different books.
+        content_start_idx = _split_find_content_start_idx(doc, contents_physical_page)
+        page_map = {}
+        title_starts = {}
+    else:
+        content_start_idx = None
+        page_map = _split_detect_printed_page_map(doc)
+        title_starts = _split_find_chapter_starts_by_title(doc, chapters)
     total_pages = len(doc)
     ranges = []
     for i, ch in enumerate(chapters):
         current_printed = ch["printed_page"]
         next_printed = chapters[i + 1]["printed_page"] if i + 1 < len(chapters) else None
-        fallback_start = contents_physical_page + current_printed - 1
+        if content_start_idx is not None:
+            fallback_start = content_start_idx + current_printed - 1
+        else:
+            fallback_start = contents_physical_page + current_printed - 1
         fitz_start = title_starts.get(current_printed, page_map.get(current_printed, fallback_start))
         if next_printed is not None:
             fallback_next_start = fitz_start + max(1, next_printed - current_printed)
@@ -2147,7 +2180,7 @@ async def get_chapters(
 @app.post("/api/split-pdf/preview")
 async def split_pdf_preview(
     file: UploadFile = File(...),
-    toc_image: Optional[UploadFile] = File(None),
+    toc_images: List[UploadFile] = File(default=[]),
     chapters_json: Optional[str] = Form(None),
     contents_physical_page: Optional[int] = Form(None),
     anchor_mode: Optional[str] = Form(None),
@@ -2162,18 +2195,25 @@ async def split_pdf_preview(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not open PDF: {e}")
     total_pages = len(doc)
-    if toc_image is not None:
+    if toc_images:
         try:
-            img_bytes = await toc_image.read()
-            chapters = _split_extract_chapters_from_image_bytes(img_bytes, toc_image.content_type or "image/png")
+            images = [(await img.read(), img.content_type or "image/png") for img in toc_images]
+            chapters = _split_extract_chapters_from_image_bytes(images)
             # If user explicitly provided the Contents page number, trust it — skip slow visual search
             if contents_physical_page is not None and contents_physical_page > 0:
-                final_cp = contents_physical_page
+                first_cp = contents_physical_page
             else:
-                detected_cp = _split_find_contents_page_from_image(doc, img_bytes, chapters)
+                # Use first image for visual page matching
+                first_img_bytes = images[0][0]
+                detected_cp = _split_find_contents_page_from_image(doc, first_img_bytes, chapters)
                 if detected_cp is None:
                     detected_cp = _split_find_contents_page_from_chapters(doc, chapters)
-                final_cp = detected_cp if detected_cp is not None else 1
+                first_cp = detected_cp if detected_cp is not None else 1
+            # Anchor off the LAST TOC page. The formula in _split_resolve_ranges is:
+            #   fitz_start = contents_physical_page + printed_page - 1
+            # so passing last_toc_page means chapter 1 lands exactly one page after
+            # the TOC ends: last_toc_page + 1 - 1 = last_toc_page (0-indexed).
+            final_cp = first_cp + len(images) - 1
             toc = {
                 "contents_physical_page": final_cp,
                 "chapters": chapters,
@@ -2228,7 +2268,7 @@ async def split_pdf_toc_from_image(image: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="Claude API key not configured")
     img_bytes = await image.read()
     try:
-        chapters = _split_extract_chapters_from_image_bytes(img_bytes, image.content_type or "image/png")
+        chapters = _split_extract_chapters_from_image_bytes([(img_bytes, image.content_type or "image/png")])
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
     return {"chapters": chapters}
