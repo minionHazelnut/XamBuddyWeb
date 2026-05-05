@@ -1,5 +1,5 @@
 # XamBuddy Admin Panel — Progress & Status
-**Last Updated**: May 3, 2026
+**Last Updated**: May 5, 2026
 
 ---
 
@@ -34,6 +34,9 @@
 - Click into a paper to view all extracted questions with answers (ExamPaperRetrieve.jsx)
 - Keywords extracted from answer key matches and stored in `keywords_json` per question
 - Guide/reference book PDF upload slot: stored in `reference_uploads` table, not copied into question bank (`/api/upload-reference`, `/api/reference-uploads`)
+- **Chapter tagging for exam questions** (`POST /api/tag-exam-question-chapters`): after extraction, classifies every `exam_questions` row where `chapter IS NULL` by batching 80 questions at a time to Claude Haiku alongside chapter names + headings from `chapter_meta`; PATCHes `chapter` field directly in the DB — no PDF re-upload needed; returns `{tagged, unmatched, total}`
+- **Social Science** added to subject dropdown in ExamPaperUploads.jsx
+- Boards in ExamPaperUploads.jsx normalised to `['Stateboard', 'CBSE', 'ICSE']` (was `['CBSE', 'ICSE', 'State']`) to match BulkUpload and `chapter_meta` exam strings
 
 ### Not Done
 - "Answer key matched" status indicator per paper in the papers table view (ExamPaperRetrieve shows question count but no explicit matched/pending flag per paper)
@@ -70,8 +73,11 @@
 - Chapter mismatch check: validates chapter name against PDF content before generating; logs error and aborts if mismatch; always sends `title_edited: true` in bulk upload to skip mismatch for non-English (Kannada) chapter PDFs
 - **PDF Splitter tool** (BulkUpload.jsx + `/api/split-pdf/preview` + `/api/split-pdf/download`): upload a full textbook PDF → detects Contents page automatically (embedded bookmarks → text scan → font-size detection) → extracts chapter titles + printed page numbers → page immediately after Contents = book page 1, all earlier pages excluded → each chapter split by exact page range → packaged as ZIP
 - **PDF Splitter screenshot fallback**: when auto-detection fails (e.g. Kannada/non-English TOC), user drops 1–3 screenshots of the Contents/Index page(s) + enters the PDF page number of the first Contents page; Claude vision reads all screenshots in one call and extracts only top-level chapter headings (sub-topics like 1.1, 1.2 ignored); multiple images supported for TOCs that span 2+ pages
-- **PDF Splitter screenshot page mapping**: physical page for each chapter resolved via `_split_find_content_start_idx` — scans the 10 pages immediately after the last TOC page, finds the first visible margin number, and anchors printed page 1 from there; adapts automatically to books with 0, 1, or 2 unnumbered opener/blank pages between TOC and content; `final_cp` passed to this function = `first_cp + num_toc_images − 1` (last TOC page, 1-indexed); full PDF margin scan disabled in screenshot mode to avoid false anchors from chapter-opener spreads
+- **PDF Splitter screenshot page mapping**: in screenshot mode `content_start_idx` is forced to `None` — no margin scan is performed; physical page for chapter with printed page N = `contents_physical_page + N − 1` (0-indexed); `final_cp = first_cp + num_toc_images − 1` (last TOC page, 0-indexed); margin scan (`_split_find_content_start_idx`) is only used in auto-detect mode (non-screenshot), where it finds the first visible margin number on the pages after the TOC to anchor printed page 1; scan was disabled in screenshot mode after NCERT running chapter-number headers in top margins were misread as page numbers, causing a +4 physical-page offset
 - **PDF Splitter non-English handling**: `_split_detect_body_font_size` calibrates threshold using English-only text spans; `_split_find_chapters_by_font` skips pages with no English content; font-size detection now works correctly for bilingual PDFs (e.g. KTBS Karnataka state board) where Kannada text would otherwise inflate the body-size threshold
+- **Fundamental Duties page filter** (`_is_fundamental_duties_page`): during PDF text extraction, pages that are NCERT "Fundamental Duties" boilerplate (Article 51A) are silently skipped so they do not pollute generated questions; detection checks for 2+ of 5 marker phrases ("fundamental duties", "article 51a", "to abide by the constitution", "to cherish and follow", "to uphold and protect")
+- **Answer hints parsing** (`_parse_answer_hints_structured`): if `answers_file` or `answers_file_2` is uploaded alongside a chapter PDF in `/api/generate`, a dedicated Claude Haiku call parses the raw answer/hints text into a structured exercise→question→answer lookup table (keyed by exercise number + question number); the lookup is embedded as context in the main generation prompt so Claude can ground answers in the textbook's own solutions instead of hallucinating
+- **Manual answer key override in bulk upload** (BulkUpload.jsx): user can drag-drop up to 2 answer PDFs in the bulk upload panel; when set, these override any `answers-1/2.pdf` auto-detected from the folder and are applied to every chapter in the batch
 
 ### Not Done
 - Rename/migrate `questions` table to `generated_questions` (still `questions`)
@@ -159,6 +165,7 @@
 | POST | `/api/split-pdf/preview` | Detect chapter boundaries in a PDF; returns chapter list with page ranges |
 | POST | `/api/split-pdf/download` | Split PDF into chapters and stream as a ZIP file |
 | POST | `/api/split-pdf/toc-from-image` | Extract chapter titles + page numbers from a single TOC screenshot using Claude vision |
+| POST | `/api/tag-exam-question-chapters` | Batch-classify all `exam_questions` rows where `chapter IS NULL` using `chapter_meta` headings; batches 80 questions per Claude call; PATCHes `chapter` field in DB; returns `{tagged, unmatched, total}` |
 
 ---
 

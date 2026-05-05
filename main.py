@@ -379,14 +379,30 @@ def get_cached_questions(q_type, difficulty, subject, exam, chapter, limit):
 
 # ---------- PDF helpers ----------
 
+_FUNDAMENTAL_DUTIES_MARKERS = [
+    "fundamental duties",
+    "article 51a",
+    "it shall be the duty of every citizen of india",
+    "constitution of india",
+    "fundamental duties of citizens",
+]
+
+def _is_fundamental_duties_page(text: str) -> bool:
+    t = text.lower()
+    hits = sum(1 for m in _FUNDAMENTAL_DUTIES_MARKERS if m in t)
+    return hits >= 2
+
+
 def extract_text(file_bytes):
     reader = PdfReader(io.BytesIO(file_bytes), strict=False)
     texts = []
     for page in reader.pages:
         try:
-            texts.append(page.extract_text() or "")
+            page_text = page.extract_text() or ""
         except Exception:
-            texts.append("")
+            page_text = ""
+        if not _is_fundamental_duties_page(page_text):
+            texts.append(page_text)
     return "".join(texts)
 
 def truncate_text(text, max_chars=18000):
@@ -1321,11 +1337,13 @@ def _split_find_content_start_idx(doc, last_toc_physical: int) -> int:
 
 def _split_resolve_ranges(doc, chapters: list, contents_physical_page: int, force_contents_mapping: bool = False) -> list:
     if force_contents_mapping:
-        # In screenshot mode, find the actual start of content by scanning the
-        # few pages right after the TOC. This handles books that have 0, 1, or 2
-        # unnumbered opener/blank pages before the first numbered content page,
-        # without needing a hard-coded offset that breaks on different books.
-        content_start_idx = _split_find_content_start_idx(doc, contents_physical_page)
+        # Screenshot mode: use the direct formula
+        #   fitz_start = contents_physical_page + printed_page - 1
+        # where contents_physical_page = last TOC page (1-indexed).
+        # _split_find_content_start_idx was here previously but was picking up
+        # chapter-number headers (e.g. NCERT running "1") as page numbers,
+        # making content_start_idx up to 4 pages too large.
+        content_start_idx = None
         page_map = {}
         title_starts = {}
     else:
@@ -1433,6 +1451,61 @@ async def get_metadata():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def _parse_answer_hints_structured(answers_text: str, api_key: str) -> str:
+    """
+    Parse raw answer-hints text into a structured lookup table string.
+    Returns a formatted string like:
+        Exercise 8.1
+          Q1: <answer>
+          Q2: <answer>
+        Exercise 8.2
+          Q1: <answer>
+    Ready to be embedded directly in the generation prompt.
+    Returns empty string if parsing fails or no structured answers found.
+    """
+    if not answers_text.strip():
+        return ""
+    client = anthropic.Anthropic(api_key=api_key)
+    try:
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4000,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "The text below is from a textbook's Answers/Hints section. "
+                    "It contains exercise headings (like 'Exercise 8.1', '8.2', 'EXERCISE 9.3', etc.) "
+                    "followed by numbered answers (1., 2., (i), (a), etc.).\n\n"
+                    "Extract every answer and return ONLY valid JSON, no markdown:\n"
+                    '{"exercises": [{"exercise": "8.1", "answers": [{"q": "1", "answer": "..."}, {"q": "2", "answer": "..."}, ...]}, ...]}\n\n'
+                    "Rules:\n"
+                    "- exercise: just the number part, e.g. '8.1', '9.3' (no word 'Exercise')\n"
+                    "- q: the question number as a string, e.g. '1', '2', '3' (use Arabic numerals even if the book uses (i), (ii))\n"
+                    "- answer: the COMPLETE answer text for that question including all parts, steps, and sub-answers\n"
+                    "- Include every exercise and every question you find\n"
+                    "- Do NOT skip or summarise any answer\n\n"
+                    f"ANSWERS TEXT:\n{truncate_text(answers_text, 15000)}"
+                )
+            }]
+        )
+        raw = resp.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("`").strip()
+        data = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        exercises = data.get("exercises", [])
+        if not exercises:
+            return ""
+        lines = ["EXERCISE ANSWERS LOOKUP (match by exercise number and question number exactly):"]
+        for ex in exercises:
+            lines.append(f"\nExercise {ex['exercise']}:")
+            for item in ex.get("answers", []):
+                ans = str(item.get("answer", "")).strip().replace("\n", " ")
+                lines.append(f"  Q{item['q']}: {ans}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 @app.post("/api/generate")
 async def generate_from_pdf(
     file: UploadFile = File(...),
@@ -1466,17 +1539,19 @@ async def generate_from_pdf(
 
     full_text = truncate_text(text, 80000)
 
-    # Extract answers PDF text if provided (state board textbooks)
-    answers_text = ""
+    # Extract and structure answers PDF text if provided (state board textbooks)
+    raw_answers_text = ""
     for af in [answers_file, answers_file_2]:
         if af is not None:
             try:
                 af_content = await af.read()
                 af_text = extract_text(af_content)
                 if af_text.strip():
-                    answers_text += af_text + "\n\n"
+                    raw_answers_text += af_text + "\n\n"
             except Exception:
                 pass
+    # Pre-parse into structured exercise→question→answer lookup
+    answers_structured = _parse_answer_hints_structured(raw_answers_text, CLAUDE_API_KEY) if raw_answers_text.strip() else ""
 
     # Consistency check: verify chapter name matches PDF content
     # Skipped if the admin manually edited/confirmed the title — their input is authoritative
@@ -1517,7 +1592,7 @@ async def generate_from_pdf(
         "mixed": "Mixed — distribute equally across easy, medium, and hard",
     }
 
-    prompt = f"""You are an expert CBSE question paper setter generating questions for Class 10/12 students.
+    prompt = f"""You are an expert question extractor for a school question bank. Your job is to extract and reproduce questions from the textbook chapter exactly as written, then source answers strictly from either the provided solutions or the textbook text itself.
 
 SUBJECT: {subject}
 CHAPTER: {chapter}
@@ -1528,21 +1603,22 @@ NUMBER OF QUESTIONS TO GENERATE: {num_q}
 
 PRACTICAL vs THEORY SPLIT: This chapter is {practical_pct}% practical and {theory_pct}% theory. Of the {num_q} questions, generate approximately {practical_count} as numerical/applied/practical questions and {theory_count} as conceptual/theoretical questions. Set is_practical to true for practical questions and false for theory questions.
 
-EXERCISE ANALYSIS RULE (most important):
-Before generating, scan the chapter content for numbered exercises (e.g. Exercise 5.1, Exercise 5.2, Q1/Q2 under each exercise, etc.) and worked/solved examples.
-- Count how many questions appear in each exercise and what TYPE they are (numerical calculation, word problem, proof, fill-in-the-blank, match, etc.).
-- Generate questions of the EXACT SAME TYPE and difficulty distribution as found in those exercises — do not invent a different style.
-- For every solved/worked example in the chapter, treat it as a TEMPLATE: generate a new question by changing the numbers, variables, or scenario while keeping the same solving method and structure.
-- The answer for each generated question must follow the SAME step-by-step solution format as the solved examples in the chapter. Show all working steps the same way the textbook does.
-- If the chapter has 3 exercises with 10 numerical problems, 5 word problems, and 2 proofs, your output must reflect roughly that ratio.
-- NEVER generate vague theory questions like "What is X?" when the chapter exercises are numerical — match the exercise style exactly.
+QUESTION SOURCE RULE (most important):
+- Extract questions directly from the chapter's numbered exercises (Exercise 5.1 Q1, Q2 etc.) and in-text questions.
+- Copy the question text verbatim or very close to verbatim from the textbook — do NOT invent new questions or change numbers/scenarios.
+- Cover ALL exercises in the chapter proportionally. Do not skip any exercise.
+- Match the question type requested: if q_type is 'short', pick short-answer style questions from the exercises; if 'mcq', pick or reformat objective questions.
 
 RULES FOR THIS QUESTION TYPE:
 {TYPE_RULES.get(q_type, '')}
 
 COVERAGE RULE: Spread questions across ALL exercises and topics in the chapter — do not concentrate on the first exercise or introduction. Every exercise section must be represented.
 
-ANSWER QUALITY RULE: Answers must follow the step-by-step format of the textbook's solved examples. Show each calculation step. Include units where applicable. A student who reads only the answer must be able to reproduce the full solution from memory.
+ANSWER SOURCING RULE — strictly follow this priority order:
+1. SOLUTIONS PDF (highest priority): If a structured answer lookup is provided below, find the exact exercise number and question number and copy that answer verbatim. Do not paraphrase, do not change numbers.
+2. TEXTBOOK TEXT (for questions not in solutions): Find the answer within the chapter content below. Use the exact words and sentences from the textbook. Do not invent or paraphrase.
+3. PRACTICAL/NUMERICAL WITHOUT PROVIDED ANSWER: If the question is a numerical/practical sum and no answer is given in the solutions, find a solved example in the chapter that uses the same method. Follow that exact procedure step by step and derive the answer. Show all working steps exactly as the textbook does.
+4. ABSOLUTE RULE: If you cannot find the answer in either the solutions or the textbook text, do NOT fabricate an answer. Write the answer as "Refer to textbook." Never invent facts, values, or explanations that are not present in the chapter.
 
 SELF-CONTAINED RULE: Do NOT reference figures, tables, examples, or page numbers by their textbook label. Every question must work as a standalone problem with all values/context given in the question itself.
 
@@ -1552,13 +1628,18 @@ OUTPUT FORMAT (return ONLY a valid JSON array, no other text):
 CHAPTER CONTENT:
 {full_text}"""
 
-    if answers_text.strip():
+    if answers_structured:
         prompt += (
-            f"\n\nEXERCISE ANSWERS (from the textbook's answers/solutions section):\n"
-            f"{truncate_text(answers_text, 20000)}\n\n"
-            "ANSWERS USAGE RULE: The above answers section contains the official textbook answers. "
-            "For every exercise question you generate, ensure its answer matches the corresponding answer in this section. "
-            "Use the same numerical values, steps, and final answer as given. Do not invent different answers."
+            f"\n\n{answers_structured}\n\n"
+            "ANSWERS MATCHING RULE (strict — follow exactly):\n"
+            "1. For every question from a specific exercise (e.g. Exercise 8.3 Q1), look up that EXACT "
+            "exercise number AND question number in the lookup table above and copy the answer verbatim.\n"
+            "2. Exercise number AND question number must both match — do not mix up Q1 and Q2.\n"
+            "3. Before finalising each answer, verify: 'Is this answer logically the answer to this question?' "
+            "If not, recheck the lookup.\n"
+            "4. If the question is not in the lookup table: apply ANSWER SOURCING RULE steps 2–4 above "
+            "(extract verbatim from textbook text, or derive from a solved example for practicals).\n"
+            "5. NEVER invent an answer. If it is not in the solutions or the chapter text, write 'Refer to textbook.'"
         )
 
     if existing_questions:
@@ -1960,6 +2041,137 @@ ANSWERS:
         "mismatched_rejected": mismatch_count,
         "total_questions": len(rows),
     }
+
+
+@app.post("/api/tag-exam-question-chapters")
+async def tag_exam_question_chapters(
+    subject: str = Form(...),
+    class_level: str = Form(...),
+    board: str = Form(...),
+    exam: str = Form(...),
+):
+    if not CLAUDE_API_KEY:
+        raise HTTPException(status_code=500, detail="Claude API key not configured")
+    if not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Supabase service key not configured")
+
+    # 1. Fetch chapters + headings from chapter_meta
+    try:
+        meta_rows = _sb_get("chapter_meta", {
+            "select": "chapter,headings",
+            "exam": f"eq.{exam}",
+            "subject": f"eq.{subject}",
+            "limit": 100,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch chapter metadata: {e}")
+
+    if not meta_rows:
+        raise HTTPException(status_code=404, detail=f"No chapters found in chapter_meta for subject='{subject}' exam='{exam}'. Generate questions for this subject first.")
+
+    # Build chapter context string for the prompt
+    chapter_lines = []
+    chapter_names = set()
+    for row in meta_rows:
+        ch = (row.get("chapter") or "").strip()
+        if not ch:
+            continue
+        chapter_names.add(ch)
+        headings = row.get("headings") or []
+        if isinstance(headings, list) and headings:
+            chapter_lines.append(f"- {ch}\n  Topics: {', '.join(headings)}")
+        else:
+            chapter_lines.append(f"- {ch}")
+    if not chapter_lines:
+        raise HTTPException(status_code=404, detail="Chapter metadata found but no chapter names could be read.")
+
+    chapter_context = "\n".join(chapter_lines)
+
+    # 2. Fetch all untagged exam questions for this subject/class/board
+    try:
+        q_rows = _sb_get("exam_questions", {
+            "select": "id,question_text,question_type",
+            "subject": f"eq.{subject}",
+            "class_level": f"eq.{class_level}",
+            "board": f"eq.{board}",
+            "chapter": "is.null",
+            "limit": 2000,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not fetch questions: {e}")
+
+    if not q_rows:
+        return {"tagged": 0, "unmatched": 0, "total": 0, "message": "No untagged questions found."}
+
+    # 3. Batch 80 questions per Claude call
+    BATCH = 80
+    claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    tagged = 0
+    unmatched = 0
+
+    for batch_start in range(0, len(q_rows), BATCH):
+        batch = q_rows[batch_start: batch_start + BATCH]
+        questions_payload = [
+            {"id": r["id"], "text": (r.get("question_text") or "")[:400], "type": r.get("question_type") or ""}
+            for r in batch
+        ]
+        prompt = f"""You are a {subject} curriculum expert for Class {class_level}.
+
+Below is a list of chapters and the topics they cover:
+
+{chapter_context}
+
+Tag each question with the chapter it belongs to. Return ONLY a valid JSON object mapping each question's id to the chapter name exactly as written above, or null if you genuinely cannot determine the chapter.
+
+QUESTIONS:
+{json.dumps(questions_payload, ensure_ascii=False)}
+
+Rules:
+- Use the chapter name EXACTLY as written in the chapter list above
+- null only if the question truly spans multiple chapters or is a general question not tied to any chapter
+- No explanation, no markdown — just the JSON object
+
+Return format:
+{{"<id>": "<chapter name or null>", ...}}"""
+
+        try:
+            resp = claude_client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=2000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw).rstrip("`").strip()
+            result = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+        except Exception as e:
+            _log_error("/api/tag-exam-question-chapters", "claude_batch", str(e), {"batch_start": batch_start})
+            continue
+
+        # 4. PATCH each matched question
+        for q_id, chapter_name in result.items():
+            if not chapter_name or chapter_name not in chapter_names:
+                unmatched += 1
+                continue
+            try:
+                url = f"{SUPABASE_URL}/rest/v1/exam_questions?id=eq.{q_id}"
+                body = json.dumps({"chapter": chapter_name}).encode()
+                headers = {**_sb_headers(), "Prefer": "return=minimal"}
+                req = urllib.request.Request(url, data=body, headers=headers, method="PATCH")
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    r.read()
+                tagged += 1
+            except Exception as e:
+                _log_error("/api/tag-exam-question-chapters", "patch_chapter", str(e), {"question_id": q_id})
+                unmatched += 1
+
+    return {
+        "tagged": tagged,
+        "unmatched": unmatched,
+        "total": len(q_rows),
+        "message": f"Tagged {tagged} of {len(q_rows)} questions. {unmatched} could not be matched.",
+    }
+
 
 @app.post("/api/upload-reference")
 async def upload_reference(

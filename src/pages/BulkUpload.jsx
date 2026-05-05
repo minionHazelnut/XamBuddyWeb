@@ -76,6 +76,9 @@ export default function BulkUpload({ showStatus }) {
   const [splitImageExtracting, setSplitImageExtracting] = useState(false)
   const [splitContentsPage, setSplitContentsPage] = useState(1)
 
+  const [manualAnswerKeys, setManualAnswerKeys] = useState([])
+  const [answerKeyDragging, setAnswerKeyDragging] = useState(false)
+
   const wakeLockRef = useRef(null)
   const processingRef = useRef(false)
 
@@ -265,7 +268,9 @@ export default function BulkUpload({ showStatus }) {
         formData.append('num_q', adjustedNumQ)
         if (ch.chapterNumber != null) formData.append('chapter_order', ch.chapterNumber)
         formData.append('title_edited', 'true')
-        const ansFiles = chapterAnswersMap[`${ch.subject}||${ch.file.name}`] || []
+        const ansFiles = manualAnswerKeys.length > 0
+          ? manualAnswerKeys
+          : (chapterAnswersMap[`${ch.subject}||${ch.file.name}`] || [])
         if (ansFiles[0]) formData.append('answers_file', ansFiles[0])
         if (ansFiles[1]) formData.append('answers_file_2', ansFiles[1])
 
@@ -484,6 +489,61 @@ export default function BulkUpload({ showStatus }) {
               onChange={handleFolderChange}
             />
           </div>
+        </div>
+
+        {/* Answer key manual upload */}
+        <div style={{ marginTop: '14px', padding: '12px 14px', background: '#f7fbfa', border: '1px solid #d4e0de', borderRadius: '8px' }}>
+          <div style={{ fontSize: '13px', fontWeight: '600', color: '#2d4a47', marginBottom: '8px' }}>
+            Answer Key / Hints PDFs
+            <span style={{ fontWeight: '400', color: '#6b8a80', marginLeft: '6px' }}>(applied to all chapters)</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+            {manualAnswerKeys.map((f, i) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: '#edf8ef', border: '1px solid #b8d8cc', borderRadius: '6px', fontSize: '12px' }}>
+                <span style={{ color: '#2e7d32', fontWeight: '500' }}>PDF {i + 1}: {f.name}</span>
+                <button
+                  onClick={() => setManualAnswerKeys(prev => prev.filter((_, j) => j !== i))}
+                  style={{ background: 'none', border: 'none', color: '#c0392b', cursor: 'pointer', fontSize: '15px', padding: '0 4px', lineHeight: 1 }}
+                  title="Remove"
+                >×</button>
+              </div>
+            ))}
+            {manualAnswerKeys.length < 2 && (
+              <label
+                htmlFor="answerKeyInput"
+                onDragOver={e => { e.preventDefault(); setAnswerKeyDragging(true) }}
+                onDragLeave={() => setAnswerKeyDragging(false)}
+                onDrop={e => {
+                  e.preventDefault()
+                  setAnswerKeyDragging(false)
+                  const dropped = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf'))
+                  if (dropped.length) setManualAnswerKeys(prev => [...prev, ...dropped].slice(0, 2))
+                }}
+                style={{
+                  display: 'block', padding: '12px 14px', textAlign: 'center',
+                  background: answerKeyDragging ? '#eef8f3' : '#fff',
+                  border: `2px dashed ${answerKeyDragging ? '#4a6e6a' : '#b8d8cc'}`,
+                  borderRadius: '6px', fontSize: '12px', color: answerKeyDragging ? '#4a6e6a' : '#6b8a80',
+                  cursor: 'pointer', transition: 'all 0.15s'
+                }}
+              >
+                {answerKeyDragging ? 'Drop PDF here' : `+ Drag or click to add answer key PDF${manualAnswerKeys.length > 0 ? ' (2nd)' : ''}`}
+              </label>
+            )}
+            <input
+              type="file" id="answerKeyInput" accept=".pdf" style={{ display: 'none' }}
+              onChange={e => {
+                const file = e.target.files?.[0]
+                if (file && file.name.toLowerCase().endsWith('.pdf')) {
+                  setManualAnswerKeys(prev => [...prev, file].slice(0, 2))
+                }
+                e.target.value = ''
+              }}
+            />
+          </div>
+          <p style={{ margin: '8px 0 0 0', fontSize: '11px', color: '#6b8a80' }}>
+            Upload up to 2 answer hint PDFs. These override any answer PDFs detected in the folder.
+          </p>
         </div>
 
         {subjectCount > 0 && (

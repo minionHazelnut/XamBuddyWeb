@@ -2,9 +2,9 @@ import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
-const BOARDS = ['CBSE', 'ICSE', 'State']
+const BOARDS = ['Stateboard', 'CBSE', 'ICSE']
 const GRADES = ['6th', '7th', '8th', '9th', '10th', '11th', '12th']
-const SUBJECTS = ['Accountancy', 'Biology', 'Business Studies', 'Chemistry', 'Economics', 'English', 'Geography', 'History', 'Mathematics', 'Physics', 'Political Science', 'Science']
+const SUBJECTS = ['Accountancy', 'Biology', 'Business Studies', 'Chemistry', 'Economics', 'English', 'Geography', 'History', 'Mathematics', 'Physics', 'Political Science', 'Science', 'Social Science']
 const UPLOAD_TYPES = ['guide_reference', 'sample_question', 'other']
 
 const sectionTitle = (text) => (
@@ -147,6 +147,13 @@ export default function ExamPaperUploads({ showStatus }) {
   const [refLoading, setRefLoading] = useState(false)
   const [refUploads, setRefUploads] = useState([])
   const [loadingRefUploads, setLoadingRefUploads] = useState(false)
+
+  // — chapter tagging state —
+  const [tagBoard, setTagBoard] = useState('')
+  const [tagGrade, setTagGrade] = useState('')
+  const [tagSubject, setTagSubject] = useState('')
+  const [tagLoading, setTagLoading] = useState(false)
+  const [tagResult, setTagResult] = useState(null)
 
   // — bulk QP upload state —
   const [bulkBoard, setBulkBoard] = useState('')
@@ -480,6 +487,29 @@ export default function ExamPaperUploads({ showStatus }) {
     setBulkProgress(null)
     fetchPapers()
     showStatus(`Bulk QP processing complete. ${totalSaved} questions saved across ${bulkPapers.length} papers.`, 'success')
+  }
+
+  async function handleTagChapters() {
+    if (!tagBoard || !tagGrade || !tagSubject) { showStatus('Select board, grade and subject first.', 'error'); return }
+    setTagLoading(true)
+    setTagResult(null)
+    const exam = `${tagGrade} ${tagBoard} Board`
+    const fd = new FormData()
+    fd.append('subject', tagSubject)
+    fd.append('class_level', tagGrade)
+    fd.append('board', tagBoard)
+    fd.append('exam', exam)
+    try {
+      const res = await fetch(`${API_BASE}/api/tag-exam-question-chapters`, { method: 'POST', body: fd })
+      const data = await res.json()
+      if (!res.ok) { showStatus(data.detail || 'Tagging failed', 'error'); return }
+      setTagResult(data)
+      showStatus(data.message, data.tagged > 0 ? 'success' : 'error')
+    } catch (err) {
+      showStatus('Error: ' + err.message, 'error')
+    } finally {
+      setTagLoading(false)
+    }
   }
 
   if (selectedPaper) {
@@ -981,7 +1011,55 @@ export default function ExamPaperUploads({ showStatus }) {
 
       {divider}
 
-      {/* ── Section 4: Reference / guide book upload ── */}
+      {/* ── Section 4: Tag exam questions by chapter ── */}
+      <div className="form-panel">
+        {sectionTitle('Tag Questions by Chapter')}
+        <p style={{ color: '#6b8a80', fontSize: '14px', marginTop: '-8px', marginBottom: '16px' }}>
+          After extracting questions from papers, run this to classify every question into its chapter using the headings stored in your chapter library.
+        </p>
+        <div className="form-row">
+          <div className="form-group">
+            <label>Board</label>
+            <select value={tagBoard} onChange={e => setTagBoard(e.target.value)} className="form-select">
+              <option value="">Select board</option>
+              {BOARDS.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Grade</label>
+            <select value={tagGrade} onChange={e => setTagGrade(e.target.value)} className="form-select">
+              <option value="">Select grade</option>
+              {GRADES.map(g => <option key={g} value={g}>{g}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>Subject</label>
+            <select value={tagSubject} onChange={e => setTagSubject(e.target.value)} className="form-select">
+              <option value="">Select subject</option>
+              {SUBJECTS.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </div>
+        </div>
+        <button
+          onClick={handleTagChapters}
+          disabled={tagLoading || !tagBoard || !tagGrade || !tagSubject}
+          className="btn-primary"
+          style={{ marginTop: '8px' }}
+        >
+          {tagLoading ? 'Tagging…' : 'Tag Chapters'}
+        </button>
+        {tagResult && (
+          <div style={{ marginTop: '12px', padding: '10px 14px', background: '#f0f8f4', border: '1px solid #b8d8cc', borderRadius: '6px', fontSize: '13px' }}>
+            <strong style={{ color: '#2e7d5a' }}>{tagResult.tagged}</strong> questions tagged &nbsp;·&nbsp;
+            <strong style={{ color: tagResult.unmatched > 0 ? '#b85c00' : '#888' }}>{tagResult.unmatched}</strong> unmatched &nbsp;·&nbsp;
+            {tagResult.total} total
+          </div>
+        )}
+      </div>
+
+      {divider}
+
+      {/* ── Section 5: Reference / guide book upload ── */}
       <div className="form-panel">
         {sectionTitle('Upload Reference Material')}
         <p style={{ color: '#6b8a80', fontSize: '14px', marginTop: '-8px', marginBottom: '16px' }}>Guide books and sample PDFs for reference only — never added to the question bank.</p>
